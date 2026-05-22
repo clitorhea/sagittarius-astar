@@ -56,16 +56,28 @@ nix build           # builds the aig package (update vendorHash first)
 
 ## Configuration
 
-`aig` reads API keys from environment variables:
+`aig` resolves settings from the following sources, in order of priority:
+1. CLI Flags (`--provider`, `--model`, `--persona`, etc.)
+2. Environment variables (`GEMINI_API_KEY`, `DEEPSEEK_API_KEY`)
+3. JSON Configuration File (`~/.config/aig/config.json`)
 
-| Provider   | Environment Variable | Default Model      |
-| ---------- | -------------------- | ------------------ |
-| `gemini`   | `GEMINI_API_KEY`     | `gemini-2.0-flash` |
-| `deepseek` | `DEEPSEEK_API_KEY`   | `deepseek-chat`    |
+On first launch, `aig` generates a default `config.json` at:
+- **Linux/macOS:** `~/.config/aig/config.json`
+- **Windows:** `%AppData%\aig\config.json`
 
-```bash
-export GEMINI_API_KEY="your-key-here"
-export DEEPSEEK_API_KEY="your-key-here"
+### `config.json` Structure
+```json
+{
+  "default_provider": "gemini",
+  "default_model": "",
+  "gemini_api_key": "YOUR_GEMINI_KEY",
+  "deepseek_api_key": "YOUR_DEEPSEEK_KEY",
+  "personas": {
+    "default": "You are aig...",
+    "sysadmin": "You are an expert Linux and Windows system administrator...",
+    "coder": "You are an expert software engineer..."
+  }
+}
 ```
 
 ---
@@ -78,21 +90,31 @@ aig
 
 # Specify provider and model
 aig --provider deepseek --model deepseek-reasoner
-aig --provider gemini --model gemini-2.5-pro
-
-# Short flags
 aig -p deepseek -m deepseek-chat
+
+# Use a custom system prompt persona
+aig --persona sysadmin
+aig -s coder
+
+# Resume a previous conversation by ID
+aig --resume 20260521-170000
+aig -r 20260521-170000
 ```
 
 ### In-session commands
 
-| Command       | Action                         |
+| Command | Action |
 | ------------- | ------------------------------ |
-| `/clear`      | Clear conversation and history |
-| `/quit`       | Exit `aig`                     |
-| `Ctrl+C`      | Cancel stream or quit          |
-| `Enter`       | Send message                   |
-| `Shift+Enter` | Insert newline in input        |
+| `/help` | Display list of available commands |
+| `/history` | List all saved conversation sessions |
+| `/load <id>` | Resume a conversation by its session ID |
+| `/save <name>` | Save/rename current session with a friendly name |
+| `/new` | Start a fresh conversation thread |
+| `/clear` | Clear viewport display (keeps system prompt) |
+| `/quit`, `/q` | Exit the application |
+| `Ctrl+C` | Cancel stream or quit |
+| `Enter` | Send message |
+| `Shift+Enter` | Insert newline in text area |
 
 ---
 

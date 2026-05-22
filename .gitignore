@@ -1,0 +1,14 @@
+# Binaries
+bin/
+
+# Go build/test cache
+.gocache/
+
+# IDE/Editor configs
+.vscode/
+.idea/
+
+# Nix
+.direnv/
+result
+result-*

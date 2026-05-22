@@ -18,6 +18,7 @@ import (
 	"fmt"
 	"regexp"
 	"strings"
+	"time"
 
 	"github.com/charmbracelet/bubbles/spinner"
 	"github.com/charmbracelet/bubbles/textarea"
@@ -29,6 +30,7 @@ import (
 	"github.com/clitorhea/sagittarius-astar.git/internal/llm"
 	"github.com/clitorhea/sagittarius-astar.git/internal/logger"
 	"github.com/clitorhea/sagittarius-astar.git/internal/sandbox"
+	"github.com/clitorhea/sagittarius-astar.git/internal/session"
 )
 
 // state represents the TUI's current operational mode.
@@ -50,6 +52,10 @@ type Model struct {
 	appState state
 	history  []llm.Message // full conversation history
 	provider llm.Provider
+
+	// Session management
+	activeSession       *session.Session
+	defaultSystemPrompt string
 
 	// Streaming state
 	tokenChan    chan string
@@ -79,12 +85,11 @@ type Model struct {
 	lastErr string
 }
 
-// NewModel constructs a new TUI model wired to the given LLM provider.
-// systemPrompt is injected as the first message in history.
-func NewModel(provider llm.Provider, systemPrompt string) (*Model, error) {
+// NewModel constructs a new TUI model wired to the given LLM provider and session.
+func NewModel(provider llm.Provider, activeSession *session.Session, defaultSystemPrompt string) (*Model, error) {
 	// Text area
 	ta := textarea.New()
-	ta.Placeholder = "Ask anything… (Enter to send, Shift+Enter for newline, /quit to exit)"
+	ta.Placeholder = "Ask anything… (Enter to send, Shift+Enter for newline, /help for commands)"
 	ta.Focus()
 	ta.CharLimit = 8000
 	ta.SetHeight(3)
@@ -99,29 +104,28 @@ func NewModel(provider llm.Provider, systemPrompt string) (*Model, error) {
 	sp.Spinner = spinner.Dot
 	sp.Style = spinnerStyle
 
-	// Glamour renderer (auto-detects dark/light terminal theme)
+	// Glamour renderer
 	renderer, err := glamour.NewTermRenderer(
-		glamour.WithAutoStyle(),
+		glamour.WithStandardStyle("dark"),
 		glamour.WithWordWrap(0), // let viewport handle wrapping
 	)
 	if err != nil {
 		return nil, fmt.Errorf("tui: failed to create glamour renderer: %w", err)
 	}
 
-	history := []llm.Message{}
-	if systemPrompt != "" {
-		history = append(history, llm.Message{Role: llm.RoleSystem, Content: systemPrompt})
+	m := &Model{
+		appState:            stateInput,
+		history:             activeSession.History,
+		provider:            provider,
+		textarea:            ta,
+		viewport:            vp,
+		spinner:             sp,
+		renderer:            renderer,
+		activeSession:       activeSession,
+		defaultSystemPrompt: defaultSystemPrompt,
 	}
 
-	return &Model{
-		appState: stateInput,
-		history:  history,
-		provider: provider,
-		textarea: ta,
-		viewport: vp,
-		spinner:  sp,
-		renderer: renderer,
-	}, nil
+	return m, nil
 }
 
 // ── Bubble Tea lifecycle ──────────────────────────────────────────────────────
@@ -131,30 +135,34 @@ func (m Model) Init() tea.Cmd {
 	return nil
 }
 
-
 // Update is the central message dispatcher.
 func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	var cmds []tea.Cmd
 
 	switch msg := msg.(type) {
 
-	// ── Window resize ──────────────────────────────────────────────────────
+	// ── Window Resized ─────────────────────────────────────────────────────
 	case tea.WindowSizeMsg:
 		m.width = msg.Width
 		m.height = msg.Height
-		headerH := 3  // banner
-		inputH := 5   // textarea + border
-		statusH := 1  // status bar
 		m.viewport.Width = msg.Width
-		m.viewport.Height = msg.Height - headerH - inputH - statusH - 2
+		m.viewport.Height = msg.Height - 8 // account for header, input area, margins
 		m.textarea.SetWidth(msg.Width - 4) // account for border padding
 		if m.renderer != nil {
 			m.renderer, _ = glamour.NewTermRenderer(
-				glamour.WithAutoStyle(),
+				glamour.WithStandardStyle("dark"),
 				glamour.WithWordWrap(m.viewport.Width-4),
 			)
 		}
-		m.refreshViewport()
+		m.loadHistory(m.history)
+
+	// ── Spinner tick ───────────────────────────────────────────────────────
+	case spinner.TickMsg:
+		if m.appState == stateStreaming || m.appState == stateExecuting {
+			var spCmd tea.Cmd
+			m.spinner, spCmd = m.spinner.Update(msg)
+			return m, spCmd
+		}
 
 	// ── Keyboard input ─────────────────────────────────────────────────────
 	case tea.KeyMsg:
@@ -166,17 +174,136 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				if input == "" {
 					break
 				}
-				// Built-in commands.
-				if input == "/quit" || input == "/exit" || input == "/q" {
-					return m, tea.Quit
-				}
-				if input == "/clear" {
-					m.outputLines = nil
-					m.history = m.history[:min(1, len(m.history))] // keep system prompt
+
+				// Slash Commands
+				if strings.HasPrefix(input, "/") {
 					m.textarea.Reset()
+
+					// Exit commands
+					if input == "/quit" || input == "/exit" || input == "/q" {
+						return m, tea.Quit
+					}
+
+					// Clear display (does not wipe history in db, just display)
+					if input == "/clear" {
+						m.outputLines = nil
+						m.history = m.history[:min(1, len(m.history))] // keep system prompt
+						m.saveSession()
+						m.refreshViewport()
+						break
+					}
+
+					// Help manual
+					if input == "/help" || input == "/?" {
+						m.appendOutput(lipgloss.NewStyle().Foreground(colorAccent).Bold(true).Render("Available commands:"))
+						m.appendOutput("  /history       List all saved conversations")
+						m.appendOutput("  /load <id>     Resume a conversation by its ID")
+						m.appendOutput("  /save <name>   Give the current conversation a friendly name")
+						m.appendOutput("  /new           Start a fresh conversation thread")
+						m.appendOutput("  /clear         Clear display output (keeps system prompt)")
+						m.appendOutput("  /quit, /q      Exit the application")
+						m.refreshViewport()
+						break
+					}
+
+					// Session history list
+					if input == "/history" {
+						sessions, err := session.List()
+						if err != nil {
+							m.appendOutput(errorStyle.Render("✗ Failed to list sessions: " + err.Error()))
+						} else if len(sessions) == 0 {
+							m.appendOutput(lipgloss.NewStyle().Foreground(colorYellow).Render("No saved conversations found."))
+						} else {
+							m.appendOutput(lipgloss.NewStyle().Foreground(colorAccent).Bold(true).Render("Saved Conversations:"))
+							for _, s := range sessions {
+								name := s.Name
+								if name == "" {
+									name = "Untitled"
+								}
+								line := fmt.Sprintf("  • %s  (%s)  [%s]", s.ID, name, s.UpdatedAt.Format("2006-01-02 15:04"))
+								if s.ID == m.activeSession.ID {
+									line += lipgloss.NewStyle().Foreground(colorGreen).Render(" (active)")
+								}
+								m.appendOutput(lipgloss.NewStyle().Foreground(colorText).Render(line))
+							}
+							m.appendOutput(lipgloss.NewStyle().Foreground(colorSubtext).Render("Use /load <id> to resume a thread, or /new to start fresh."))
+						}
+						m.refreshViewport()
+						break
+					}
+
+					// Create new conversation
+					if input == "/new" {
+						m.activeSession = &session.Session{
+							ID:        session.GenerateID(),
+							Name:      "Untitled",
+							CreatedAt: time.Now(),
+							UpdatedAt: time.Now(),
+							Provider:  m.activeSession.Provider,
+							Model:     m.activeSession.Model,
+						}
+						if m.defaultSystemPrompt != "" {
+							m.activeSession.History = []llm.Message{{
+								Role:    llm.RoleSystem,
+								Content: m.defaultSystemPrompt,
+							}}
+						}
+						m.history = m.activeSession.History
+						m.outputLines = nil
+						m.saveSession()
+						m.appendOutput(lipgloss.NewStyle().Foreground(colorGreen).Render("Started fresh session: " + m.activeSession.ID))
+						m.refreshViewport()
+						break
+					}
+
+					// Rename/Save session
+					if strings.HasPrefix(input, "/save ") || strings.HasPrefix(input, "/rename ") {
+						name := strings.TrimSpace(strings.TrimPrefix(input, "/save "))
+						if strings.HasPrefix(input, "/rename ") {
+							name = strings.TrimSpace(strings.TrimPrefix(input, "/rename "))
+						}
+						if name == "" {
+							m.appendOutput(errorStyle.Render("✗ Please provide a name (e.g. /save my-topic)"))
+							m.refreshViewport()
+							break
+						}
+						m.activeSession.Name = name
+						if err := session.Save(m.activeSession); err != nil {
+							m.appendOutput(errorStyle.Render("✗ Failed to save: " + err.Error()))
+						} else {
+							m.appendOutput(lipgloss.NewStyle().Foreground(colorGreen).Render("Conversation renamed to: " + name))
+						}
+						m.refreshViewport()
+						break
+					}
+
+					// Load session
+					if strings.HasPrefix(input, "/load ") {
+						id := strings.TrimSpace(strings.TrimPrefix(input, "/load "))
+						if id == "" {
+							m.appendOutput(errorStyle.Render("✗ Please specify a session ID (e.g. /load 20260521-120000)"))
+							m.refreshViewport()
+							break
+						}
+						s, err := session.Load(id)
+						if err != nil {
+							m.appendOutput(errorStyle.Render("✗ Failed to load session: " + err.Error()))
+						} else {
+							m.activeSession = s
+							m.loadHistory(s.History)
+							m.appendOutput(lipgloss.NewStyle().Foreground(colorGreen).Render("Loaded session: " + s.ID))
+						}
+						m.refreshViewport()
+						break
+					}
+
+					// Unknown command fallback
+					m.appendOutput(errorStyle.Render("✗ Unknown command. Type /help to see available commands."))
 					m.refreshViewport()
 					break
 				}
+
+				// Standard user prompt submission
 				m.textarea.Reset()
 				logger.L.Info("user prompt submitted",
 					"prompt_len", len(input),
@@ -249,6 +376,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			Content: raw,
 		})
 		logger.L.Info("stream completed", "response_len", len(raw))
+		m.saveSession()
 
 		// Render the full response through glamour.
 		rendered, err := m.renderer.Render(raw)
@@ -257,7 +385,6 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 
 		// Replace the streaming preview with the final rendered output.
-		// Pop the last streaming line and replace with rendered content.
 		if len(m.outputLines) > 0 {
 			m.outputLines = m.outputLines[:len(m.outputLines)-1]
 		}
@@ -315,6 +442,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				Role:    llm.RoleSystem,
 				Content: fmt.Sprintf("Command executed:\n```%s\n%s\n```\n\nOutput:\n%s", m.pendingLang, m.pendingCmd, msg.output),
 			})
+			m.saveSession()
 		}
 		m.pendingCmd = ""
 		m.pendingLang = ""
@@ -387,12 +515,67 @@ func (m Model) View() string {
 
 // ── Internal helpers ──────────────────────────────────────────────────────────
 
+// loadHistory updates the model's history and fully renders it to the viewport display.
+func (m *Model) loadHistory(history []llm.Message) {
+	m.outputLines = nil
+	m.history = history
+
+	for i, msg := range m.history {
+		if msg.Role == llm.RoleSystem {
+			if i == 0 {
+				// Initial system prompt is not rendered in output
+				continue
+			}
+			// Command execution feedback from sandboxing
+			m.outputLines = append(m.outputLines,
+				systemLabelStyle.Render("⚙ System Context (Execution Feedback):"),
+				systemContentStyle.Render(msg.Content),
+				divider(m.width),
+			)
+			continue
+		}
+
+		if msg.Role == llm.RoleUser {
+			label := userLabelStyle.Render("You")
+			m.outputLines = append(m.outputLines,
+				label,
+				lipgloss.NewStyle().Foreground(colorText).Render(msg.Content),
+				divider(m.width),
+			)
+		} else if msg.Role == llm.RoleAssistant {
+			rendered, err := m.renderer.Render(msg.Content)
+			if err != nil {
+				rendered = msg.Content
+			}
+			label := assistantLabelStyle.Render("aig")
+			m.outputLines = append(m.outputLines,
+				label,
+				strings.TrimRight(rendered, "\n"),
+				divider(m.width),
+			)
+		}
+	}
+}
+
+// saveSession persists the active session history to disk.
+func (m *Model) saveSession() {
+	if m.activeSession == nil {
+		return
+	}
+	m.activeSession.History = m.history
+	if err := session.Save(m.activeSession); err != nil {
+		logger.L.Error("failed to auto-save session", "id", m.activeSession.ID, "error", err)
+	}
+}
+
 // submitPrompt adds the user's message to history and renders it in the viewport.
 func (m Model) submitPrompt(input string) Model {
 	m.history = append(m.history, llm.Message{
 		Role:    llm.RoleUser,
 		Content: input,
 	})
+	m.saveSession()
+
 	label := userLabelStyle.Render("You")
 	m.outputLines = append(m.outputLines,
 		label,
@@ -436,8 +619,7 @@ func waitForToken(ch chan string) tea.Cmd {
 	return func() tea.Msg {
 		token, ok := <-ch
 		if !ok {
-			// Channel closed — stream done. The streamCmd goroutine already
-			// sent streamDoneMsg or streamErrMsg; returning nil here is safe.
+			// Channel closed — stream done.
 			return nil
 		}
 		return tokenMsg(token)
@@ -496,13 +678,26 @@ func (m Model) statusBar() string {
 		statusText = "● ready"
 	}
 
-	padding := m.width - lipgloss.Width(statusText) - 4
+	// Show active session ID in status bar
+	sessionInfo := ""
+	if m.activeSession != nil {
+		name := m.activeSession.Name
+		if name == "" {
+			name = "Untitled"
+		}
+		sessionInfo = fmt.Sprintf("session: %s (%s)", m.activeSession.ID, name)
+	}
+
+	leftText := statusText
+	if sessionInfo != "" {
+		leftText = fmt.Sprintf("%s · %s", statusText, sessionInfo)
+	}
+
+	padding := m.width - lipgloss.Width(leftText) - 4
 	if padding < 0 {
 		padding = 0
 	}
 	spacer := strings.Repeat(" ", padding)
-	help := lipgloss.NewStyle().Foreground(colorSubtext).Render("ctrl+c quit · /clear reset")
-	return statusBarStyle.Width(m.width).Render(statusText + spacer + help)
+	help := lipgloss.NewStyle().Foreground(colorSubtext).Render("ctrl+c quit · /help menu")
+	return statusBarStyle.Width(m.width).Render(leftText + spacer + help)
 }
-
-

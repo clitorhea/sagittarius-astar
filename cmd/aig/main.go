@@ -5,6 +5,8 @@
 //	aig [flags]
 //	aig --provider gemini --model gemini-2.0-flash
 //	aig --provider deepseek --model deepseek-chat
+//	aig --persona sysadmin         # use custom prompt persona
+//	aig --resume 20260521-120000   # resume previous session
 //	aig --log-level debug          # verbose file logging
 package main
 
@@ -12,6 +14,7 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/spf13/cobra"
@@ -19,12 +22,15 @@ import (
 	"github.com/clitorhea/sagittarius-astar.git/internal/config"
 	"github.com/clitorhea/sagittarius-astar.git/internal/llm"
 	"github.com/clitorhea/sagittarius-astar.git/internal/logger"
+	"github.com/clitorhea/sagittarius-astar.git/internal/session"
 	"github.com/clitorhea/sagittarius-astar.git/internal/tui"
 )
 
 var (
 	flagProvider string
 	flagModel    string
+	flagPersona  string
+	flagResume   string
 	flagLogLevel string
 	flagLogFile  string
 )
@@ -43,28 +49,35 @@ var rootCmd = &cobra.Command{
 multiple LLM providers (Gemini, DeepSeek) and can securely execute
 shell commands with your explicit consent.
 
-Environment Variables:
-  GEMINI_API_KEY    Required when using --provider gemini
-  DEEPSEEK_API_KEY  Required when using --provider deepseek
-
-Logs are written to: ~/.cache/aig/aig.log  (override with --log-file)
+Configuration file is located at: ~/.config/aig/config.json
+Sessions are saved to: ~/.local/share/aig/sessions/
+Logs are written to: ~/.cache/aig/aig.log
 
 Examples:
   aig
   aig --provider deepseek
-  aig --provider gemini --model gemini-2.5-pro
+  aig --persona sysadmin
+  aig --resume 20260521-170000
   aig --log-level debug`,
 	RunE: runChat,
 }
 
 func init() {
 	rootCmd.PersistentFlags().StringVarP(
-		&flagProvider, "provider", "p", "gemini",
+		&flagProvider, "provider", "p", "",
 		"LLM provider to use (gemini | deepseek)",
 	)
 	rootCmd.PersistentFlags().StringVarP(
 		&flagModel, "model", "m", "",
 		"Model name (defaults to provider's recommended model)",
+	)
+	rootCmd.PersistentFlags().StringVarP(
+		&flagPersona, "persona", "s", "default",
+		"System prompt persona to use (default | sysadmin | coder | custom)",
+	)
+	rootCmd.PersistentFlags().StringVarP(
+		&flagResume, "resume", "r", "",
+		"Resume a previous conversation by session ID",
 	)
 	rootCmd.PersistentFlags().StringVar(
 		&flagLogLevel, "log-level", "info",
@@ -86,13 +99,12 @@ func runChat(_ *cobra.Command, _ []string) error {
 
 	cleanupLog, err := logger.Init(logLevel, flagLogFile)
 	if err != nil {
-		// Log init failure is non-fatal: print a warning and continue without logging.
 		fmt.Fprintf(os.Stderr, "warning: logging disabled: %v\n", err)
 	}
 	defer cleanupLog()
 
 	// ── Configuration ─────────────────────────────────────────────────────────
-	cfg, err := config.Load(config.ProviderName(flagProvider), flagModel)
+	cfg, err := config.Load(config.ProviderName(flagProvider), flagModel, flagPersona)
 	if err != nil {
 		logger.L.Error("config load failed", "error", err)
 		return fmt.Errorf("configuration error: %w\n\nRun 'aig --help' for usage", err)
@@ -101,8 +113,40 @@ func runChat(_ *cobra.Command, _ []string) error {
 	logger.L.Info("aig starting",
 		"provider", cfg.Provider,
 		"model", cfg.Model,
+		"persona", flagPersona,
 		"log_file", logger.LogPath,
 	)
+
+	// ── Session Resolution ───────────────────────────────────────────────────
+	var activeSession *session.Session
+	if flagResume != "" {
+		activeSession, err = session.Load(flagResume)
+		if err != nil {
+			logger.L.Error("failed to load session to resume", "id", flagResume, "error", err)
+			return fmt.Errorf("failed to resume session %q: %w", flagResume, err)
+		}
+		logger.L.Info("resuming session", "id", activeSession.ID, "turns", len(activeSession.History))
+	} else {
+		activeSession = &session.Session{
+			ID:        session.GenerateID(),
+			Name:      "Untitled",
+			CreatedAt: time.Now(),
+			UpdatedAt: time.Now(),
+			Provider:  string(cfg.Provider),
+			Model:     cfg.Model,
+		}
+		if cfg.SystemPrompt != "" {
+			activeSession.History = []llm.Message{{
+				Role:    llm.RoleSystem,
+				Content: cfg.SystemPrompt,
+			}}
+		}
+		// Save the session right away to allocate it
+		if err := session.Save(activeSession); err != nil {
+			logger.L.Error("failed to save new session initial state", "error", err)
+		}
+		logger.L.Info("created fresh session", "id", activeSession.ID)
+	}
 
 	// ── Provider ──────────────────────────────────────────────────────────────
 	var provider llm.Provider
@@ -121,7 +165,7 @@ func runChat(_ *cobra.Command, _ []string) error {
 	logger.L.Debug("provider initialised", "provider", cfg.Provider, "model", cfg.Model)
 
 	// ── TUI ───────────────────────────────────────────────────────────────────
-	model, err := tui.NewModel(provider, cfg.SystemPrompt)
+	model, err := tui.NewModel(provider, activeSession, cfg.SystemPrompt)
 	if err != nil {
 		logger.L.Error("TUI init failed", "error", err)
 		return fmt.Errorf("failed to initialize TUI: %w", err)

@@ -73,6 +73,17 @@ var (
 			Foreground(colorText).
 			PaddingLeft(1)
 
+	// systemLabelStyle renders the system messages in history.
+	systemLabelStyle = lipgloss.NewStyle().
+			Foreground(colorSubtext).
+			Italic(true).
+			PaddingRight(1)
+
+	// systemContentStyle renders system message content in history.
+	systemContentStyle = lipgloss.NewStyle().
+			Foreground(colorSubtext).
+			Italic(true)
+
 	// inputStyle wraps the text-input area.
 	inputStyle = lipgloss.NewStyle().
 			Border(lipgloss.RoundedBorder()).
