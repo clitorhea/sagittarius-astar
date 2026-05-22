@@ -12,3 +12,7 @@ bin/
 .direnv/
 result
 result-*
+
+# Archives
+*.zip
+
