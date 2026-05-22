@@ -1,19 +1,23 @@
 // Package tui — Lipgloss style definitions for the aig TUI.
 package tui
 
-import "github.com/charmbracelet/lipgloss"
+import (
+	"fmt"
+
+	"github.com/charmbracelet/lipgloss"
+)
 
 var (
 	// Color palette — cohesive dark-mode aesthetic.
-	colorBase      = lipgloss.Color("#1e1e2e") // Catppuccin Mocha base
-	colorSurface   = lipgloss.Color("#313244") // surface0
-	colorAccent    = lipgloss.Color("#cba6f7") // mauve
-	colorGreen     = lipgloss.Color("#a6e3a1") // green
-	colorRed       = lipgloss.Color("#f38ba8") // red
-	colorYellow    = lipgloss.Color("#f9e2af") // yellow
-	colorSubtext   = lipgloss.Color("#6c7086") // subtext0
-	colorText      = lipgloss.Color("#cdd6f4") // text
-	colorOverlay   = lipgloss.Color("#45475a") // overlay0
+	colorBase    = lipgloss.Color("#1e1e2e") // Catppuccin Mocha base
+	colorSurface = lipgloss.Color("#313244") // surface0
+	colorAccent  = lipgloss.Color("#cba6f7") // mauve
+	colorGreen   = lipgloss.Color("#a6e3a1") // green
+	colorRed     = lipgloss.Color("#f38ba8") // red
+	colorYellow  = lipgloss.Color("#f9e2af") // yellow
+	colorSubtext = lipgloss.Color("#6c7086") // subtext0
+	colorText    = lipgloss.Color("#cdd6f4") // text
+	colorOverlay = lipgloss.Color("#45475a") // overlay0
 
 	// promptStyle renders the "> " user-input prefix.
 	promptStyle = lipgloss.NewStyle().
@@ -75,14 +79,14 @@ var (
 
 	// systemLabelStyle renders the system messages in history.
 	systemLabelStyle = lipgloss.NewStyle().
-			Foreground(colorSubtext).
-			Italic(true).
-			PaddingRight(1)
+				Foreground(colorSubtext).
+				Italic(true).
+				PaddingRight(1)
 
 	// systemContentStyle renders system message content in history.
 	systemContentStyle = lipgloss.NewStyle().
-			Foreground(colorSubtext).
-			Italic(true)
+				Foreground(colorSubtext).
+				Italic(true)
 
 	// inputStyle wraps the text-input area.
 	inputStyle = lipgloss.NewStyle().
@@ -98,7 +102,7 @@ var (
 )
 
 // headerBanner returns the styled ASCII art header shown on startup.
-func headerBanner() string {
+func headerBanner(version string) string {
 	banner := lipgloss.NewStyle().
 		Foreground(colorAccent).
 		Bold(true).
@@ -106,7 +110,7 @@ func headerBanner() string {
 
 	subtitle := lipgloss.NewStyle().
 		Foreground(colorSubtext).
-		Render("  terminal AI agent  ·  type /help for commands")
+		Render(fmt.Sprintf("  terminal AI agent %s ·  type /help for commands", version))
 
 	return banner + "\n" + subtitle + "\n"
 }

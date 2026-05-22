@@ -37,9 +37,9 @@ type FileConfig struct {
 }
 
 var defaultPersonas = map[string]string{
-	"default": "You are aig, a highly capable terminal-based AI assistant. When suggesting shell commands, always wrap them in a fenced code block with the appropriate language tag (```bash, ```sh, or ```ps1). Be concise, precise, and helpful.",
+	"default":  "You are aig, a highly capable terminal-based AI assistant. When suggesting shell commands, always wrap them in a fenced code block with the appropriate language tag (```bash, ```sh, or ```ps1). Be concise, precise, and helpful.",
 	"sysadmin": "You are an expert Linux and Windows system administrator. Focus on providing clean, secure, and robust shell commands. Explain potential risks before executing commands.",
-	"coder": "You are an expert software engineer. Provide high-quality, readable, and well-structured code. Keep explanations minimal and focus on code patterns and correctness.",
+	"coder":    "You are an expert software engineer. Provide high-quality, readable, and well-structured code. Keep explanations minimal and focus on code patterns and correctness.",
 }
 
 // Path returns the config file location: ~/.config/aig/config.json

@@ -33,6 +33,8 @@ var (
 	flagResume   string
 	flagLogLevel string
 	flagLogFile  string
+
+	version = "dev" // Injected by LDFLAGS during build
 )
 
 func main() {
@@ -165,7 +167,7 @@ func runChat(_ *cobra.Command, _ []string) error {
 	logger.L.Debug("provider initialised", "provider", cfg.Provider, "model", cfg.Model)
 
 	// ── TUI ───────────────────────────────────────────────────────────────────
-	model, err := tui.NewModel(provider, activeSession, cfg.SystemPrompt)
+	model, err := tui.NewModel(provider, activeSession, cfg.SystemPrompt, version)
 	if err != nil {
 		logger.L.Error("TUI init failed", "error", err)
 		return fmt.Errorf("failed to initialize TUI: %w", err)

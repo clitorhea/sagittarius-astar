@@ -16,6 +16,7 @@ package tui
 import (
 	"context"
 	"fmt"
+	"os"
 	"regexp"
 	"strings"
 	"time"
@@ -31,6 +32,7 @@ import (
 	"github.com/clitorhea/sagittarius-astar.git/internal/logger"
 	"github.com/clitorhea/sagittarius-astar.git/internal/sandbox"
 	"github.com/clitorhea/sagittarius-astar.git/internal/session"
+	"github.com/clitorhea/sagittarius-astar.git/internal/workspace"
 )
 
 // state represents the TUI's current operational mode.
@@ -83,10 +85,13 @@ type Model struct {
 
 	// Error message to display
 	lastErr string
+
+	// App version string
+	appVersion string
 }
 
 // NewModel constructs a new TUI model wired to the given LLM provider and session.
-func NewModel(provider llm.Provider, activeSession *session.Session, defaultSystemPrompt string) (*Model, error) {
+func NewModel(provider llm.Provider, activeSession *session.Session, defaultSystemPrompt string, appVersion string) (*Model, error) {
 	// Text area
 	ta := textarea.New()
 	ta.Placeholder = "Ask anything… (Enter to send, Shift+Enter for newline, /help for commands)"
@@ -123,6 +128,7 @@ func NewModel(provider llm.Provider, activeSession *session.Session, defaultSyst
 		renderer:            renderer,
 		activeSession:       activeSession,
 		defaultSystemPrompt: defaultSystemPrompt,
+		appVersion:          appVersion,
 	}
 
 	return m, nil
@@ -272,6 +278,27 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 							m.appendOutput(errorStyle.Render("✗ Failed to save: " + err.Error()))
 						} else {
 							m.appendOutput(lipgloss.NewStyle().Foreground(colorGreen).Render("Conversation renamed to: " + name))
+						}
+						m.refreshViewport()
+						break
+					}
+
+					// Workspace map
+					if strings.HasPrefix(input, "/map ") || input == "/map" {
+						dir := strings.TrimSpace(strings.TrimPrefix(input, "/map"))
+						if dir == "" {
+							dir = "."
+						}
+						tree, err := workspace.MapDirectory(dir)
+						if err != nil {
+							m.appendOutput(errorStyle.Render("✗ Failed to map directory: " + err.Error()))
+						} else {
+							m.history = append(m.history, llm.Message{
+								Role:    llm.RoleSystem,
+								Content: fmt.Sprintf("Workspace Map for '%s':\n```\n%s\n```", dir, tree),
+							})
+							m.saveSession()
+							m.appendOutput(lipgloss.NewStyle().Foreground(colorSubtext).Render(fmt.Sprintf("🗺️ Mapped workspace %s", dir)))
 						}
 						m.refreshViewport()
 						break
@@ -480,7 +507,7 @@ func (m Model) View() string {
 	var b strings.Builder
 
 	// Header banner.
-	b.WriteString(headerBanner())
+	b.WriteString(headerBanner(m.appVersion))
 	b.WriteString(divider(m.width))
 	b.WriteString("\n")
 
@@ -570,6 +597,23 @@ func (m *Model) saveSession() {
 
 // submitPrompt adds the user's message to history and renders it in the viewport.
 func (m Model) submitPrompt(input string) Model {
+	// 1. Process /read(file) macros
+	reRead := regexp.MustCompile(`\/read\(([^)]+)\)`)
+	matches := reRead.FindAllStringSubmatch(input, -1)
+	for _, match := range matches {
+		filename := match[1]
+		content, err := os.ReadFile(filename)
+		if err != nil {
+			m.appendOutput(errorStyle.Render(fmt.Sprintf("✗ Could not read %s: %v", filename, err)))
+		} else {
+			m.history = append(m.history, llm.Message{
+				Role:    llm.RoleSystem,
+				Content: fmt.Sprintf("File Context: %s\n```\n%s\n```", filename, string(content)),
+			})
+			m.appendOutput(lipgloss.NewStyle().Foreground(colorSubtext).Render(fmt.Sprintf("📎 Attached %s", filename)))
+		}
+	}
+
 	m.history = append(m.history, llm.Message{
 		Role:    llm.RoleUser,
 		Content: input,
@@ -598,7 +642,9 @@ func (m *Model) startStreaming() []tea.Cmd {
 
 	// Background goroutine — calls the LLM provider.
 	streamCmd := func() tea.Msg {
-		err := m.provider.StreamChat(ctx, m.history, ch)
+		// Prune to a default context limit (100k tokens approx ~400k chars)
+		prunedHistory := llm.PruneHistory(m.history, 100000)
+		err := m.provider.StreamChat(ctx, prunedHistory, ch)
 		if err != nil {
 			return streamErrMsg{err: err}
 		}
