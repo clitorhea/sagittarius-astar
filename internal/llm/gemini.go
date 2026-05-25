@@ -4,6 +4,7 @@ package llm
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 
 	"google.golang.org/genai"
@@ -41,7 +42,7 @@ func NewGeminiProvider(apiKey, model string) (*GeminiProvider, error) {
 // google.golang.org/genai v1.x returns iter.Seq2[*genai.GenerateContentResponse, error]
 // from GenerateContentStream. We consume it with the Go 1.23 range-over-func pattern,
 // which is cleaner and doesn't require the google.golang.org/api/iterator sentinel.
-func (g *GeminiProvider) StreamChat(ctx context.Context, messages []Message, tokenChan chan<- string) error {
+func (g *GeminiProvider) StreamChat(ctx context.Context, messages []Message, tools []Tool, tokenChan chan<- string) (*ToolCall, error) {
 	defer close(tokenChan)
 
 	logger.L.Debug("gemini: stream starting",
@@ -66,7 +67,19 @@ func (g *GeminiProvider) StreamChat(ctx context.Context, messages []Message, tok
 		case RoleUser:
 			contents = append(contents, genai.NewContentFromText(msg.Content, genai.RoleUser))
 		case RoleAssistant:
-			contents = append(contents, genai.NewContentFromText(msg.Content, genai.RoleModel))
+			// if it had a tool call, we need to map it
+			if len(msg.ToolCalls) > 0 {
+				tc := msg.ToolCalls[0]
+				contents = append(contents, genai.NewContentFromFunctionCall(tc.Name, tc.Args, genai.RoleModel))
+			} else {
+				contents = append(contents, genai.NewContentFromText(msg.Content, genai.RoleModel))
+			}
+		case RoleTool:
+			var response map[string]any
+			if err := json.Unmarshal([]byte(msg.Content), &response); err != nil {
+				response = map[string]any{"output": msg.Content}
+			}
+			contents = append(contents, genai.NewContentFromFunctionResponse(msg.ToolName, response, genai.RoleUser))
 		}
 	}
 
@@ -74,13 +87,24 @@ func (g *GeminiProvider) StreamChat(ctx context.Context, messages []Message, tok
 	if systemInstruction != nil {
 		cfg.SystemInstruction = systemInstruction
 	}
+	if len(tools) > 0 {
+		var decls []*genai.FunctionDeclaration
+		for _, t := range tools {
+			decls = append(decls, &genai.FunctionDeclaration{
+				Name:                 t.Name,
+				Description:          t.Description,
+				ParametersJsonSchema: t.Parameters,
+			})
+		}
+		cfg.Tools = []*genai.Tool{{FunctionDeclarations: decls}}
+	}
 
 	// GenerateContentStream returns iter.Seq2[*genai.GenerateContentResponse, error].
 	// Range-over-func is the idiomatic way to consume it in Go 1.23+.
 	for resp, err := range g.client.Models.GenerateContentStream(ctx, g.model, contents, cfg) {
 		if err != nil {
 			logger.L.Error("gemini: stream error", "error", err)
-			return fmt.Errorf("gemini: stream error: %w", err)
+			return nil, fmt.Errorf("gemini: stream error: %w", err)
 		}
 
 		for _, cand := range resp.Candidates {
@@ -88,12 +112,19 @@ func (g *GeminiProvider) StreamChat(ctx context.Context, messages []Message, tok
 				continue
 			}
 			for _, part := range cand.Content.Parts {
+				if part.FunctionCall != nil {
+					return &ToolCall{
+						ID:   part.FunctionCall.ID,
+						Name: part.FunctionCall.Name,
+						Args: part.FunctionCall.Args,
+					}, nil
+				}
 				if part.Text != "" {
 					tokenCount++
 					select {
 					case <-ctx.Done():
 						logger.L.Warn("gemini: stream cancelled by context", "tokens_received", tokenCount)
-						return ctx.Err()
+						return nil, ctx.Err()
 					case tokenChan <- part.Text:
 					}
 				}
@@ -101,5 +132,5 @@ func (g *GeminiProvider) StreamChat(ctx context.Context, messages []Message, tok
 		}
 	}
 
-	return nil
+	return nil, nil
 }

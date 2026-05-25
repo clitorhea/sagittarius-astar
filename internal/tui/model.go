@@ -43,6 +43,7 @@ const (
 	stateStreaming                  // LLM is streaming tokens.
 	stateConfirmingCmd              // Awaiting y/n for command execution.
 	stateExecuting                  // Sandbox command is running.
+	stateExecutingTool              // Agent tool is executing autonomously.
 )
 
 // execLangs are the code fence tags that trigger the sandbox prompt.
@@ -69,8 +70,9 @@ type Model struct {
 	pendingLang string
 
 	// UI components
-	textarea textarea.Model
-	viewport viewport.Model
+	textarea    textarea.Model
+	cmdTextarea textarea.Model
+	viewport    viewport.Model
 	spinner  spinner.Model
 
 	// Layout
@@ -101,6 +103,13 @@ func NewModel(provider llm.Provider, activeSession *session.Session, defaultSyst
 	ta.ShowLineNumbers = false
 	ta.KeyMap.InsertNewline.SetKeys("shift+enter")
 
+	cta := textarea.New()
+	cta.Placeholder = "Edit command before running... (Enter to execute, Esc to cancel)"
+	cta.CharLimit = 8000
+	cta.SetHeight(5)
+	cta.ShowLineNumbers = true
+	cta.KeyMap.InsertNewline.SetKeys("shift+enter")
+
 	// Viewport
 	vp := viewport.New(80, 20)
 
@@ -123,6 +132,7 @@ func NewModel(provider llm.Provider, activeSession *session.Session, defaultSyst
 		history:             activeSession.History,
 		provider:            provider,
 		textarea:            ta,
+		cmdTextarea:         cta,
 		viewport:            vp,
 		spinner:             sp,
 		renderer:            renderer,
@@ -154,6 +164,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.viewport.Width = msg.Width
 		m.viewport.Height = msg.Height - 8 // account for header, input area, margins
 		m.textarea.SetWidth(msg.Width - 4) // account for border padding
+		m.cmdTextarea.SetWidth(msg.Width - 4)
 		if m.renderer != nil {
 			m.renderer, _ = glamour.NewTermRenderer(
 				glamour.WithStandardStyle("dark"),
@@ -164,7 +175,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	// ── Spinner tick ───────────────────────────────────────────────────────
 	case spinner.TickMsg:
-		if m.appState == stateStreaming || m.appState == stateExecuting {
+		if m.appState == stateStreaming || m.appState == stateExecuting || m.appState == stateExecutingTool {
 			var spCmd tea.Cmd
 			m.spinner, spCmd = m.spinner.Update(msg)
 			return m, spCmd
@@ -357,27 +368,37 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 
 		case stateConfirmingCmd:
-			switch {
-			case msg.Type == tea.KeyRunes && (string(msg.Runes) == "y" || string(msg.Runes) == "Y"):
+			switch msg.Type {
+			case tea.KeyEsc:
+				logger.L.Info("sandbox: user declined execution", "lang", m.pendingLang)
+				m.appState = stateInput
+				m.cmdTextarea.Blur()
+				m.textarea.Focus()
+				m.appendOutput(confirmStyle.Render("✗ Command skipped."))
+				m.refreshViewport()
+				return m, nil
+			case tea.KeyEnter:
+				cmd := strings.TrimSpace(m.cmdTextarea.Value())
+				if cmd == "" {
+					return m, nil
+				}
 				logger.L.Info("sandbox: user approved execution",
 					"lang", m.pendingLang,
-					"command", m.pendingCmd,
+					"command", cmd,
 				)
+				m.pendingCmd = cmd
 				m.appState = stateExecuting
+				m.cmdTextarea.Blur()
 				m.appendOutput(confirmStyle.Render("⚡ Executing…"))
 				m.refreshViewport()
 				return m, m.runSandboxCmd()
-
-			case msg.Type == tea.KeyEscape,
-				msg.Type == tea.KeyRunes && (string(msg.Runes) == "n" || string(msg.Runes) == "N"):
-				logger.L.Info("sandbox: user declined execution", "lang", m.pendingLang)
-				m.appState = stateInput
-				m.appendOutput(confirmStyle.Render("✗ Command skipped."))
-				m.refreshViewport()
-
-			case msg.Type == tea.KeyCtrlC:
+			case tea.KeyCtrlC:
 				return m, tea.Quit
 			}
+
+			var cmd tea.Cmd
+			m.cmdTextarea, cmd = m.cmdTextarea.Update(msg)
+			return m, cmd
 
 		case stateExecuting:
 			if msg.Type == tea.KeyCtrlC {
@@ -412,7 +433,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 
 		// Replace the streaming preview with the final rendered output.
-		if len(m.outputLines) > 0 {
+		if len(m.outputLines) > 0 && strings.Contains(m.outputLines[len(m.outputLines)-1], "…") {
 			m.outputLines = m.outputLines[:len(m.outputLines)-1]
 		}
 		label := assistantLabelStyle.Render("aig")
@@ -428,10 +449,14 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.pendingLang = lang
 			m.appState = stateConfirmingCmd
 
-			// Highlight the block and show confirmation prompt.
+			// Highlight the block and prepare confirmation textarea.
 			block := codeBlockStyle.Render("```" + lang + "\n" + cmd + "\n```")
-			prompt := confirmStyle.Render(fmt.Sprintf("[Execute this %s block? (y/N)]", lang))
-			m.outputLines = append(m.outputLines, block, prompt)
+			m.outputLines = append(m.outputLines, block)
+			
+			m.cmdTextarea.SetValue(cmd)
+			m.textarea.Blur()
+			m.cmdTextarea.Focus()
+			
 			m.refreshViewport()
 			return m, nil
 		}
@@ -476,6 +501,51 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.appState = stateInput
 		m.refreshViewport()
 		return m, nil
+
+	// ── Tool execution result ──────────────────────────────────────────────
+	case toolCallMsg:
+		m.appState = stateExecutingTool
+
+		if len(m.outputLines) > 0 && strings.Contains(m.outputLines[len(m.outputLines)-1], "…") {
+			m.outputLines = m.outputLines[:len(m.outputLines)-1]
+		}
+
+		m.appendOutput(lipgloss.NewStyle().Foreground(colorYellow).Render(fmt.Sprintf("⚙ Executing tool: %s", msg.Call.Name)))
+		m.refreshViewport()
+
+		m.history = append(m.history, llm.Message{
+			Role:      llm.RoleAssistant,
+			ToolCalls: []llm.ToolCall{msg.Call},
+		})
+
+		call := msg.Call
+		return m, func() tea.Msg {
+			resultStr, err := ExecuteTool(call)
+			if err != nil {
+				return toolCallResultMsg{CallID: call.ID, Name: call.Name, Result: "", Error: err}
+			}
+			return toolCallResultMsg{CallID: call.ID, Name: call.Name, Result: resultStr, Error: nil}
+		}
+
+	case toolCallResultMsg:
+		resContent := msg.Result
+		if msg.Error != nil {
+			resContent = fmt.Sprintf("Error: %s", msg.Error.Error())
+			m.appendOutput(errorStyle.Render(fmt.Sprintf("✗ Tool %s failed", msg.Name)))
+		} else {
+			m.appendOutput(lipgloss.NewStyle().Foreground(colorGreen).Render(fmt.Sprintf("✓ Tool %s succeeded", msg.Name)))
+		}
+		m.refreshViewport()
+
+		m.history = append(m.history, llm.Message{
+			Role:       llm.RoleTool,
+			Content:    resContent,
+			ToolCallID: msg.CallID,
+			ToolName:   msg.Name,
+		})
+		m.saveSession()
+
+		return m, tea.Batch(m.startStreaming()...)
 	}
 
 	// ── Delegate to sub-components ─────────────────────────────────────────
@@ -528,12 +598,19 @@ func (m Model) View() string {
 			m.spinner.View() + " " + lipgloss.NewStyle().Foreground(colorSubtext).Render("streaming…"),
 		))
 	case stateConfirmingCmd:
-		b.WriteString(inputStyle.Render(
-			confirmStyle.Render("Press y to execute, n / Esc to skip"),
+		b.WriteString(inputActiveStyle.Render(
+			lipgloss.JoinVertical(lipgloss.Left,
+				confirmStyle.Render(fmt.Sprintf("Review %s block (Enter to run, Esc to cancel, Shift+Enter for newline):", m.pendingLang)),
+				m.cmdTextarea.View(),
+			),
 		))
 	case stateExecuting:
 		b.WriteString(inputStyle.Render(
 			m.spinner.View() + " " + lipgloss.NewStyle().Foreground(colorSubtext).Render("running command…"),
+		))
+	case stateExecutingTool:
+		b.WriteString(inputStyle.Render(
+			m.spinner.View() + " " + lipgloss.NewStyle().Foreground(colorSubtext).Render("executing tool…"),
 		))
 	}
 
@@ -644,9 +721,12 @@ func (m *Model) startStreaming() []tea.Cmd {
 	streamCmd := func() tea.Msg {
 		// Prune to a default context limit (100k tokens approx ~400k chars)
 		prunedHistory := llm.PruneHistory(m.history, 100000)
-		err := m.provider.StreamChat(ctx, prunedHistory, ch)
+		toolCall, err := m.provider.StreamChat(ctx, prunedHistory, AgentTools(), ch)
 		if err != nil {
 			return streamErrMsg{err: err}
+		}
+		if toolCall != nil {
+			return toolCallMsg{Call: *toolCall}
 		}
 		return streamDoneMsg{}
 	}
@@ -696,11 +776,11 @@ func (m *Model) refreshViewportStreaming() {
 	preview := strings.TrimRight(m.streamBuffer, "\n")
 	lines := m.outputLines
 	// Replace the last line (the "…" spinner placeholder) with live text.
-	if len(lines) > 0 {
+	if len(lines) > 0 && strings.Contains(lines[len(lines)-1], "…") {
 		lines = lines[:len(lines)-1]
 	}
 	label := assistantLabelStyle.Render("aig")
-	content := strings.Join(lines, "\n") + "\n" + label + "\n" + preview
+	content := strings.Join(lines, "\n\n") + "\n\n" + label + "\n" + preview
 	m.viewport.SetContent(content)
 	m.viewport.GotoBottom()
 }
@@ -719,7 +799,9 @@ func (m Model) statusBar() string {
 	case stateConfirmingCmd:
 		statusText = "⚠ awaiting confirmation"
 	case stateExecuting:
-		statusText = "⚙ executing"
+		statusText = "⚙ executing command"
+	case stateExecutingTool:
+		statusText = "⚙ executing tool"
 	default:
 		statusText = "● ready"
 	}

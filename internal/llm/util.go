@@ -35,6 +35,14 @@ func PruneHistory(messages []Message, maxTokens int) []Message {
 	// We remove from the front of the remaining slice.
 	for len(messages) > 0 {
 		messages = messages[1:]
+		
+		// If the new first message is a tool response, it means its
+		// corresponding tool call was just pruned. We must drop it too,
+		// because the API requires tool responses to immediately follow tool calls.
+		for len(messages) > 0 && messages[0].Role == RoleTool {
+			messages = messages[1:]
+		}
+
 		total := EstimateHistoryTokens(messages)
 		if hasSystemPrompt {
 			total += EstimateTokens(systemPrompt.Content)

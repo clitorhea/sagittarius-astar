@@ -5,6 +5,7 @@ package llm
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -34,7 +35,7 @@ func NewDeepSeekProvider(apiKey, model string) (*DeepSeekProvider, error) {
 
 // StreamChat streams a response from DeepSeek into tokenChan.
 // The channel is always closed before this function returns.
-func (d *DeepSeekProvider) StreamChat(ctx context.Context, messages []Message, tokenChan chan<- string) error {
+func (d *DeepSeekProvider) StreamChat(ctx context.Context, messages []Message, tools []Tool, tokenChan chan<- string) (*ToolCall, error) {
 	defer close(tokenChan)
 
 	logger.L.Debug("deepseek: stream starting",
@@ -55,13 +56,32 @@ func (d *DeepSeekProvider) StreamChat(ctx context.Context, messages []Message, t
 			role = openai.ChatMessageRoleSystem
 		case RoleAssistant:
 			role = openai.ChatMessageRoleAssistant
+		case RoleTool:
+			role = openai.ChatMessageRoleTool
 		default:
 			role = openai.ChatMessageRoleUser
 		}
-		oaiMessages = append(oaiMessages, openai.ChatCompletionMessage{
-			Role:    role,
-			Content: msg.Content,
-		})
+
+		oaiMsg := openai.ChatCompletionMessage{
+			Role:       role,
+			Content:    msg.Content,
+			Name:       msg.ToolName,
+			ToolCallID: msg.ToolCallID,
+		}
+		if len(msg.ToolCalls) > 0 {
+			for _, tc := range msg.ToolCalls {
+				b, _ := json.Marshal(tc.Args)
+				oaiMsg.ToolCalls = append(oaiMsg.ToolCalls, openai.ToolCall{
+					ID:   tc.ID,
+					Type: openai.ToolTypeFunction,
+					Function: openai.FunctionCall{
+						Name:      tc.Name,
+						Arguments: string(b),
+					},
+				})
+			}
+		}
+		oaiMessages = append(oaiMessages, oaiMsg)
 	}
 
 	req := openai.ChatCompletionRequest{
@@ -70,27 +90,66 @@ func (d *DeepSeekProvider) StreamChat(ctx context.Context, messages []Message, t
 		Stream:   true,
 	}
 
+	if len(tools) > 0 {
+		for _, t := range tools {
+			req.Tools = append(req.Tools, openai.Tool{
+				Type: openai.ToolTypeFunction,
+				Function: &openai.FunctionDefinition{
+					Name:        t.Name,
+					Description: t.Description,
+					Parameters:  t.Parameters,
+				},
+			})
+		}
+	}
+
 	stream, err := d.client.CreateChatCompletionStream(ctx, req)
 	if err != nil {
-		return fmt.Errorf("deepseek: failed to create stream: %w", err)
+		return nil, fmt.Errorf("deepseek: failed to create stream: %w", err)
 	}
 	defer stream.Close()
+
+	var pendingToolCall *ToolCall
+	var pendingToolArgs string
 
 	for {
 		resp, err := stream.Recv()
 		if errors.Is(err, io.EOF) {
-			return nil
+			return nil, nil
 		}
 		if err != nil {
 			logger.L.Error("deepseek: stream recv error", "error", err)
-			return fmt.Errorf("deepseek: stream error: %w", err)
+			return nil, fmt.Errorf("deepseek: stream error: %w", err)
 		}
 
 		if len(resp.Choices) == 0 {
 			continue
 		}
 
-		delta := resp.Choices[0].Delta.Content
+		choice := resp.Choices[0]
+
+		if len(choice.Delta.ToolCalls) > 0 {
+			tc := choice.Delta.ToolCalls[0]
+			if tc.Function.Name != "" {
+				pendingToolCall = &ToolCall{
+					ID:   tc.ID,
+					Name: tc.Function.Name,
+				}
+			}
+			pendingToolArgs += tc.Function.Arguments
+		}
+
+		if choice.FinishReason == openai.FinishReasonToolCalls && pendingToolCall != nil {
+			var args map[string]any
+			if err := json.Unmarshal([]byte(pendingToolArgs), &args); err != nil {
+				// fallback if not valid json
+				args = map[string]any{"raw": pendingToolArgs}
+			}
+			pendingToolCall.Args = args
+			return pendingToolCall, nil
+		}
+
+		delta := choice.Delta.Content
 		if delta == "" {
 			continue
 		}
@@ -99,7 +158,7 @@ func (d *DeepSeekProvider) StreamChat(ctx context.Context, messages []Message, t
 		select {
 		case <-ctx.Done():
 			logger.L.Warn("deepseek: stream cancelled by context", "tokens_received", tokenCount)
-			return ctx.Err()
+			return nil, ctx.Err()
 		case tokenChan <- delta:
 		}
 	}

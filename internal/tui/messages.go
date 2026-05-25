@@ -1,6 +1,8 @@
 // Package tui — custom Bubble Tea message types for the aig TUI.
 package tui
 
+import "github.com/clitorhea/sagittarius-astar.git/internal/llm"
+
 // tokenMsg carries a single streamed token chunk from the LLM.
 type tokenMsg string
 
@@ -23,6 +25,11 @@ type execResultMsg struct {
 type execConfirmMsg struct {
 	Command string
 	Lang    string
+}
+
+// toolCallMsg signals that the LLM requested to execute a tool.
+type toolCallMsg struct {
+	Call llm.ToolCall
 }
 
 // windowSizeMsg is re-exported here for clarity (bubbletea sends tea.WindowSizeMsg natively).
