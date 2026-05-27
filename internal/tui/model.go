@@ -858,6 +858,33 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.appState = stateInput
 				m.textarea.Focus()
 				return m, nil
+			case tea.KeyDelete:
+				if m.selectionType == "history" && len(m.selectionItems) > 0 {
+					selected := m.selectionItems[m.selectionIdx]
+					if m.activeSession != nil && selected.ID == m.activeSession.ID {
+						m.appendOutput(errorStyle.Render("✗ Cannot delete the active session."))
+						m.refreshViewport()
+						return m, nil
+					}
+					if err := session.Delete(selected.ID); err != nil {
+						m.appendOutput(errorStyle.Render("✗ Failed to delete session: " + err.Error()))
+					} else {
+						m.appendOutput(lipgloss.NewStyle().Foreground(colorGreen).Render("🗑 Deleted session: " + selected.ID))
+						m.selectionItems = append(m.selectionItems[:m.selectionIdx], m.selectionItems[m.selectionIdx+1:]...)
+						if m.selectionIdx >= len(m.selectionItems) {
+							m.selectionIdx = len(m.selectionItems) - 1
+						}
+						if m.selectionIdx < 0 {
+							m.selectionIdx = 0
+						}
+						if len(m.selectionItems) == 0 {
+							m.appState = stateInput
+							m.textarea.Focus()
+						}
+					}
+					m.refreshViewport()
+					return m, nil
+				}
 			case tea.KeyEnter:
 				if len(m.selectionItems) == 0 {
 					m.appState = stateInput
@@ -1309,7 +1336,6 @@ func (m Model) generateSessionTitleCmd() tea.Cmd {
 
 		tokenChan := make(chan string, 100)
 		go func() {
-			defer close(tokenChan)
 			_, _, err := provider.StreamChat(ctx, []llm.Message{
 				{Role: llm.RoleUser, Content: prompt},
 			}, nil, tokenChan)
