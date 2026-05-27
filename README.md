@@ -144,8 +144,8 @@ aig -r 20260521-170000
 | `/persona <name>` | Switch the system prompt/persona on-the-fly (takes effect on next message) |
 | `/approve-tools on\|off` | Toggle auto-approve mode for commands (shows `⚡auto` badge in status bar when active) |
 | `/map [dir]` | Generates and injects a tree-like map of `[dir]` into the conversation history |
-| `/quit` or `/q` | Exit the application |
-| `Ctrl+C` | Cancel a running command / token stream, or quit |
+| `/exit` | Exit the application |
+| `Ctrl+C` | Cancel a running command / token stream |
 | `Enter` | Send message |
 | `Shift+Enter` | Insert a newline in the text area |
 

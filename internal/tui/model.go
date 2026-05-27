@@ -47,10 +47,16 @@ const (
 	stateExecutingTool                  // Agent tool is executing autonomously.
 	stateExecutingTools                 // Multiple agent tools executing concurrently.
 	stateConfirmingWrite                // Awaiting y/n for write_file tool.
+	stateSelecting                      // Selecting options (models, history, providers, personas)
 )
 
 // execLangs are the code fence tags that trigger the sandbox prompt.
 var execLangPattern = regexp.MustCompile("(?m)^```(bash|sh|ps1|powershell)\n((?s).*?)\n```")
+
+type selectionItem struct {
+	ID    string
+	Label string
+}
 
 // Model is the Bubble Tea application model for aig.
 type Model struct {
@@ -62,6 +68,11 @@ type Model struct {
 	// Session management
 	activeSession       *session.Session
 	defaultSystemPrompt string
+
+	// Selection state
+	selectionItems []selectionItem
+	selectionIdx   int
+	selectionType  string // "model", "history", "provider", "persona"
 
 	// Provider / model identity (for status bar)
 	activeProvider string
@@ -289,24 +300,33 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 						sessions, err := session.List()
 						if err != nil {
 							m.appendOutput(errorStyle.Render("✗ Failed to list sessions: " + err.Error()))
-						} else if len(sessions) == 0 {
-							m.appendOutput(lipgloss.NewStyle().Foreground(colorYellow).Render("No saved conversations found."))
-						} else {
-							m.appendOutput(lipgloss.NewStyle().Foreground(colorAccent).Bold(true).Render("Saved Conversations:"))
-							for _, s := range sessions {
-								name := s.Name
-								if name == "" {
-									name = "Untitled"
-								}
-								line := fmt.Sprintf("  • %s  (%s)  [%s]", s.ID, name, s.UpdatedAt.Format("2006-01-02 15:04"))
-								if s.ID == m.activeSession.ID {
-									line += lipgloss.NewStyle().Foreground(colorGreen).Render(" (active)")
-								}
-								m.appendOutput(lipgloss.NewStyle().Foreground(colorText).Render(line))
-							}
-							m.appendOutput(lipgloss.NewStyle().Foreground(colorSubtext).Render("Use /load <id> to resume a thread, or /new to start fresh."))
+							m.refreshViewport()
+							break
 						}
-						m.refreshViewport()
+						if len(sessions) == 0 {
+							m.appendOutput(lipgloss.NewStyle().Foreground(colorYellow).Render("No saved conversations found."))
+							m.refreshViewport()
+							break
+						}
+						m.selectionItems = nil
+						m.selectionIdx = 0
+						m.selectionType = "history"
+						for _, s := range sessions {
+							name := s.Name
+							if name == "" {
+								name = "Untitled"
+							}
+							label := fmt.Sprintf("%s · %s (%s)", s.ID, name, s.UpdatedAt.Format("2006-01-02 15:04"))
+							if s.ID == m.activeSession.ID {
+								label += " (active)"
+							}
+							m.selectionItems = append(m.selectionItems, selectionItem{
+								ID:    s.ID,
+								Label: label,
+							})
+						}
+						m.appState = stateSelecting
+						m.textarea.Blur()
 						break
 					}
 
@@ -399,11 +419,39 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					}
 
 					// Load session
-					if strings.HasPrefix(input, "/load ") {
-						id := strings.TrimSpace(strings.TrimPrefix(input, "/load "))
+					if strings.HasPrefix(input, "/load") {
+						id := strings.TrimSpace(strings.TrimPrefix(input, "/load"))
 						if id == "" {
-							m.appendOutput(errorStyle.Render("✗ Please specify a session ID (e.g. /load 20260521-120000)"))
-							m.refreshViewport()
+							sessions, err := session.List()
+							if err != nil {
+								m.appendOutput(errorStyle.Render("✗ Failed to list sessions: " + err.Error()))
+								m.refreshViewport()
+								break
+							}
+							if len(sessions) == 0 {
+								m.appendOutput(lipgloss.NewStyle().Foreground(colorYellow).Render("No saved conversations found."))
+								m.refreshViewport()
+								break
+							}
+							m.selectionItems = nil
+							m.selectionIdx = 0
+							m.selectionType = "history"
+							for _, s := range sessions {
+								name := s.Name
+								if name == "" {
+									name = "Untitled"
+								}
+								label := fmt.Sprintf("%s · %s (%s)", s.ID, name, s.UpdatedAt.Format("2006-01-02 15:04"))
+								if s.ID == m.activeSession.ID {
+									label += " (active)"
+								}
+								m.selectionItems = append(m.selectionItems, selectionItem{
+									ID:    s.ID,
+									Label: label,
+								})
+							}
+							m.appState = stateSelecting
+							m.textarea.Blur()
 							break
 						}
 						s, err := session.Load(id)
@@ -418,33 +466,33 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 						break
 					}
 
-					// ── /model [name] ──────────────────────────────────────────
+				// ── /model [name] ──────────────────────────────────────────
 				if strings.HasPrefix(input, "/model") {
 					arg := strings.TrimSpace(strings.TrimPrefix(input, "/model"))
 
 					if arg == "" {
-						// List available models for current provider
 						prov := config.ProviderName(m.activeProvider)
 						models, ok := config.KnownModels[prov]
-						m.appendOutput(lipgloss.NewStyle().Foreground(colorAccent).Bold(true).Render(
-							fmt.Sprintf("Models for %s:", m.activeProvider)))
-						if ok {
-							for _, pair := range models {
-								marker := "  "
-								if pair[0] == m.activeModel {
-									marker = lipgloss.NewStyle().Foreground(colorGreen).Render("▶ ")
-								}
-								m.appendOutput(fmt.Sprintf("%s%-30s %s",
-									marker,
-									lipgloss.NewStyle().Foreground(colorText).Render(pair[0]),
-									lipgloss.NewStyle().Foreground(colorSubtext).Render(pair[1]),
-								))
-							}
-						} else {
+						if !ok || len(models) == 0 {
 							m.appendOutput(lipgloss.NewStyle().Foreground(colorSubtext).Render("  (no known models for this provider)"))
+							m.refreshViewport()
+							break
 						}
-						m.appendOutput(lipgloss.NewStyle().Foreground(colorSubtext).Render("Usage: /model <id>"))
-						m.refreshViewport()
+						m.selectionItems = nil
+						m.selectionIdx = 0
+						m.selectionType = "model"
+						for _, pair := range models {
+							label := fmt.Sprintf("%s (%s)", pair[1], pair[0])
+							if pair[0] == m.activeModel {
+								label += " (active)"
+							}
+							m.selectionItems = append(m.selectionItems, selectionItem{
+								ID:    pair[0],
+								Label: label,
+							})
+						}
+						m.appState = stateSelecting
+						m.textarea.Blur()
 						break
 					}
 
@@ -477,18 +525,22 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					arg := strings.TrimSpace(strings.TrimPrefix(input, "/provider"))
 
 					if arg == "" {
-						// List providers
 						providers := []string{"gemini", "deepseek"}
-						m.appendOutput(lipgloss.NewStyle().Foreground(colorAccent).Bold(true).Render("Available providers:"))
+						m.selectionItems = nil
+						m.selectionIdx = 0
+						m.selectionType = "provider"
 						for _, p := range providers {
-							marker := "  "
+							label := p
 							if p == m.activeProvider {
-								marker = lipgloss.NewStyle().Foreground(colorGreen).Render("▶ ")
+								label += " (active)"
 							}
-							m.appendOutput(marker + lipgloss.NewStyle().Foreground(colorText).Render(p))
+							m.selectionItems = append(m.selectionItems, selectionItem{
+								ID:    p,
+								Label: label,
+							})
 						}
-						m.appendOutput(lipgloss.NewStyle().Foreground(colorSubtext).Render("Usage: /provider <name>"))
-						m.refreshViewport()
+						m.appState = stateSelecting
+						m.textarea.Blur()
 						break
 					}
 
@@ -525,14 +577,22 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					arg := strings.TrimSpace(strings.TrimPrefix(input, "/persona"))
 
 					if arg == "" {
-						// List available personas
 						names := config.PersonaList(m.fileConfig)
-						m.appendOutput(lipgloss.NewStyle().Foreground(colorAccent).Bold(true).Render("Available personas:"))
+						m.selectionItems = nil
+						m.selectionIdx = 0
+						m.selectionType = "persona"
 						for _, name := range names {
-							m.appendOutput("  " + lipgloss.NewStyle().Foreground(colorText).Render(name))
+							label := name
+							if name == m.activePersona {
+								label += " (active)"
+							}
+							m.selectionItems = append(m.selectionItems, selectionItem{
+								ID:    name,
+								Label: label,
+							})
 						}
-						m.appendOutput(lipgloss.NewStyle().Foreground(colorSubtext).Render("Usage: /persona <name>"))
-						m.refreshViewport()
+						m.appState = stateSelecting
+						m.textarea.Blur()
 						break
 					}
 
@@ -772,6 +832,37 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			var cmd tea.Cmd
 			m.cmdTextarea, cmd = m.cmdTextarea.Update(msg)
 			return m, cmd
+
+		case stateSelecting:
+			switch msg.Type {
+			case tea.KeyUp, tea.KeyPgUp:
+				m.selectionIdx--
+				if m.selectionIdx < 0 {
+					m.selectionIdx = len(m.selectionItems) - 1
+				}
+				return m, nil
+			case tea.KeyDown, tea.KeyPgDown:
+				m.selectionIdx++
+				if m.selectionIdx >= len(m.selectionItems) {
+					m.selectionIdx = 0
+				}
+				return m, nil
+			case tea.KeyEsc:
+				m.appState = stateInput
+				m.textarea.Focus()
+				return m, nil
+			case tea.KeyEnter:
+				if len(m.selectionItems) == 0 {
+					m.appState = stateInput
+					m.textarea.Focus()
+					return m, nil
+				}
+				selected := m.selectionItems[m.selectionIdx]
+				m.appState = stateInput
+				m.textarea.Focus()
+				return m.handleSelection(selected.ID)
+			}
+			return m, nil
 		}
 
 	// ── Streaming token received ───────────────────────────────────────────
@@ -1024,9 +1115,142 @@ func (m Model) View() string {
 			m.spinner.View() + " " + lipgloss.NewStyle().Foreground(colorSubtext).Render(
 				fmt.Sprintf("executing tools… (%d remaining)", remaining)),
 		))
+	case stateSelecting:
+		var items []string
+		title := fmt.Sprintf("Select %s (Up/Down arrows to navigate, Enter to select, Esc to cancel):", m.selectionType)
+		items = append(items, confirmStyle.Render(title))
+
+		start := 0
+		end := len(m.selectionItems)
+		if len(m.selectionItems) > 4 {
+			start = m.selectionIdx - 1
+			if start < 0 {
+				start = 0
+			}
+			end = start + 4
+			if end > len(m.selectionItems) {
+				end = len(m.selectionItems)
+				start = end - 4
+			}
+		}
+
+		for i := start; i < end; i++ {
+			item := m.selectionItems[i]
+			marker := "  "
+			style := lipgloss.NewStyle().Foreground(colorText)
+			if i == m.selectionIdx {
+				marker = "▶ "
+				style = lipgloss.NewStyle().Foreground(colorGreen).Bold(true)
+			}
+			items = append(items, style.Render(fmt.Sprintf("%s%s", marker, item.Label)))
+		}
+		b.WriteString(inputActiveStyle.Render(
+			lipgloss.JoinVertical(lipgloss.Left, items...),
+		))
 	}
 
 	return b.String()
+}
+
+// handleSelection processes the interactive list selection.
+func (m Model) handleSelection(id string) (Model, tea.Cmd) {
+	switch m.selectionType {
+	case "model":
+		m.activeModel = id
+		if m.activeSession != nil {
+			m.activeSession.Model = id
+			m.saveSession()
+		}
+		apiKey, hasKey := m.apiKeys[m.activeProvider]
+		if !hasKey || apiKey == "" {
+			m.appendOutput(errorStyle.Render(fmt.Sprintf("✗ No API key stored for provider %q", m.activeProvider)))
+			m.refreshViewport()
+			return m, nil
+		}
+		newProvider, err := llm.NewProvider(m.activeProvider, apiKey, id)
+		if err != nil {
+			m.appendOutput(errorStyle.Render("✗ Failed to switch model: " + err.Error()))
+		} else {
+			m.provider = newProvider
+			m.appendOutput(lipgloss.NewStyle().Foreground(colorGreen).Render(
+				fmt.Sprintf("✓ Model switched to: %s", id)))
+		}
+		m.refreshViewport()
+		return m, nil
+
+	case "history":
+		s, err := session.Load(id)
+		if err != nil {
+			m.appendOutput(errorStyle.Render("✗ Failed to load session: " + err.Error()))
+			m.refreshViewport()
+			return m, nil
+		}
+		m.activeSession = s
+		if s.Provider != "" {
+			m.activeProvider = s.Provider
+		}
+		if s.Model != "" {
+			m.activeModel = s.Model
+		}
+		apiKey, hasKey := m.apiKeys[m.activeProvider]
+		if hasKey && apiKey != "" {
+			newProvider, err := llm.NewProvider(m.activeProvider, apiKey, m.activeModel)
+			if err == nil {
+				m.provider = newProvider
+			}
+		}
+		m.loadHistory(s.History)
+		m.appendOutput(lipgloss.NewStyle().Foreground(colorGreen).Render("Loaded session: " + s.ID))
+		return m, nil
+
+	case "provider":
+		apiKey, hasKey := m.apiKeys[id]
+		if !hasKey || apiKey == "" {
+			m.appendOutput(errorStyle.Render(fmt.Sprintf(
+				"✗ No API key configured for %q. Set it in ~/.config/aig/config.json or via environment variable.", id)))
+			m.refreshViewport()
+			return m, nil
+		}
+		defaultModel := string(config.DefaultModel(config.ProviderName(id)))
+		newProvider, err := llm.NewProvider(id, apiKey, defaultModel)
+		if err != nil {
+			m.appendOutput(errorStyle.Render("✗ Failed to switch provider: " + err.Error()))
+		} else {
+			m.provider = newProvider
+			m.activeProvider = id
+			m.activeModel = defaultModel
+			if m.activeSession != nil {
+				m.activeSession.Provider = id
+				m.activeSession.Model = defaultModel
+				m.saveSession()
+			}
+			m.appendOutput(lipgloss.NewStyle().Foreground(colorGreen).Render(
+				fmt.Sprintf("✓ Switched to provider: %s  model: %s", id, defaultModel)))
+		}
+		m.refreshViewport()
+		return m, nil
+
+	case "persona":
+		prompt, ok := config.ResolvePersona(id, m.fileConfig)
+		if !ok {
+			m.appendOutput(errorStyle.Render(fmt.Sprintf("✗ Unknown persona %q.", id)))
+			m.refreshViewport()
+			return m, nil
+		}
+		m.defaultSystemPrompt = prompt
+		m.activePersona = id
+		if len(m.history) > 0 && m.history[0].Role == llm.RoleSystem {
+			m.history[0].Content = prompt
+		} else {
+			m.history = append([]llm.Message{{Role: llm.RoleSystem, Content: prompt}}, m.history...)
+		}
+		m.saveSession()
+		m.appendOutput(lipgloss.NewStyle().Foreground(colorGreen).Render(
+			fmt.Sprintf("✓ Persona switched to %q (effective next message)", id)))
+		m.refreshViewport()
+		return m, nil
+	}
+	return m, nil
 }
 
 // ── Internal helpers ──────────────────────────────────────────────────────────
