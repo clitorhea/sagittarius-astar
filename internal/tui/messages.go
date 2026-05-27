@@ -27,9 +27,16 @@ type execConfirmMsg struct {
 	Lang    string
 }
 
-// toolCallMsg signals that the LLM requested to execute a tool.
+// toolCallMsg signals that the LLM requested a single tool call.
+// Kept for backward compatibility; new code uses toolCallBatchMsg.
 type toolCallMsg struct {
 	Call llm.ToolCall
+}
+
+// toolCallBatchMsg signals that the LLM requested one or more tool calls
+// in a single turn. This is the primary dispatch path.
+type toolCallBatchMsg struct {
+	Calls []llm.ToolCall
 }
 
 // windowSizeMsg is re-exported here for clarity (bubbletea sends tea.WindowSizeMsg natively).

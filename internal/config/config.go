@@ -19,6 +19,20 @@ const (
 	ProviderDeepSeek ProviderName = "deepseek"
 )
 
+// KnownModels lists the available models for each provider.
+// Each entry is [apiID, friendlyLabel].
+var KnownModels = map[ProviderName][][2]string{
+	ProviderGemini: {
+		{"gemini-2.0-flash", "Gemini 2.0 Flash"},
+		{"gemini-2.5-flash", "Gemini 2.5 Flash"},
+		{"gemini-2.5-pro", "Gemini 2.5 Pro"},
+	},
+	ProviderDeepSeek: {
+		{"deepseek-v4-flash", "DeepSeek V4 Flash (default)"},
+		{"deepseek-v4-pro", "DeepSeek V4 Pro (reasoner)"},
+	},
+}
+
 // Config holds all runtime configuration for aig.
 type Config struct {
 	Provider     ProviderName
@@ -65,10 +79,64 @@ func Path() string {
 func DefaultModel(p ProviderName) string {
 	switch p {
 	case ProviderDeepSeek:
-		return "deepseek-chat"
+		return "deepseek-v4-flash"
 	default:
 		return "gemini-2.0-flash"
 	}
+}
+
+// PersonaList returns all persona names available from a FileConfig.
+// Built-in defaults are always included; user-defined ones are merged.
+func PersonaList(fc *FileConfig) []string {
+	seen := make(map[string]struct{})
+	var names []string
+	for k := range defaultPersonas {
+		if _, ok := seen[k]; !ok {
+			seen[k] = struct{}{}
+			names = append(names, k)
+		}
+	}
+	if fc != nil {
+		for k := range fc.Personas {
+			if _, ok := seen[k]; !ok {
+				seen[k] = struct{}{}
+				names = append(names, k)
+			}
+		}
+	}
+	return names
+}
+
+// ResolvePersona returns the system prompt string for the given persona name,
+// consulting user-defined personas first, then built-in defaults.
+func ResolvePersona(name string, fc *FileConfig) (string, bool) {
+	name = strings.ToLower(name)
+	if fc != nil {
+		if prompt, ok := fc.Personas[name]; ok {
+			return prompt, true
+		}
+	}
+	if prompt, ok := defaultPersonas[name]; ok {
+		return prompt, true
+	}
+	return "", false
+}
+
+// LoadFileConfig reads and parses the config file, returning a zero-value
+// FileConfig (not an error) if the file is absent or unreadable.
+func LoadFileConfig() *FileConfig {
+	data, err := os.ReadFile(Path())
+	if err != nil {
+		return &FileConfig{Personas: defaultPersonas}
+	}
+	var fc FileConfig
+	if err := json.Unmarshal(data, &fc); err != nil {
+		return &FileConfig{Personas: defaultPersonas}
+	}
+	if fc.Personas == nil {
+		fc.Personas = defaultPersonas
+	}
+	return &fc
 }
 
 // WriteDefaultConfig writes a boilerplate configuration file if none exists.

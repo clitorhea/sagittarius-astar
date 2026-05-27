@@ -35,7 +35,8 @@ func NewDeepSeekProvider(apiKey, model string) (*DeepSeekProvider, error) {
 
 // StreamChat streams a response from DeepSeek into tokenChan.
 // The channel is always closed before this function returns.
-func (d *DeepSeekProvider) StreamChat(ctx context.Context, messages []Message, tools []Tool, tokenChan chan<- string) (*ToolCall, error) {
+// Returns all tool calls requested in this turn (may be > 1).
+func (d *DeepSeekProvider) StreamChat(ctx context.Context, messages []Message, tools []Tool, tokenChan chan<- string) ([]ToolCall, error) {
 	defer close(tokenChan)
 
 	logger.L.Debug("deepseek: stream starting",
@@ -109,13 +110,18 @@ func (d *DeepSeekProvider) StreamChat(ctx context.Context, messages []Message, t
 	}
 	defer stream.Close()
 
-	var pendingToolCall *ToolCall
-	var pendingToolArgs string
+	// pendingCalls accumulates tool calls across streaming deltas.
+	// DeepSeek sends them index-by-index with incremental argument JSON.
+	pendingCalls := make(map[int]*struct {
+		id   string
+		name string
+		args string
+	})
 
 	for {
 		resp, err := stream.Recv()
 		if errors.Is(err, io.EOF) {
-			return nil, nil
+			break
 		}
 		if err != nil {
 			logger.L.Error("deepseek: stream recv error", "error", err)
@@ -128,25 +134,50 @@ func (d *DeepSeekProvider) StreamChat(ctx context.Context, messages []Message, t
 
 		choice := resp.Choices[0]
 
-		if len(choice.Delta.ToolCalls) > 0 {
-			tc := choice.Delta.ToolCalls[0]
-			if tc.Function.Name != "" {
-				pendingToolCall = &ToolCall{
-					ID:   tc.ID,
-					Name: tc.Function.Name,
-				}
+		// Accumulate all tool call deltas by index.
+		for _, tc := range choice.Delta.ToolCalls {
+			idx := tc.Index
+			if idx == nil {
+				i := 0
+				idx = &i
 			}
-			pendingToolArgs += tc.Function.Arguments
+			entry := pendingCalls[*idx]
+			if entry == nil {
+				entry = &struct {
+					id   string
+					name string
+					args string
+				}{}
+				pendingCalls[*idx] = entry
+			}
+			if tc.ID != "" {
+				entry.id = tc.ID
+			}
+			if tc.Function.Name != "" {
+				entry.name = tc.Function.Name
+			}
+			entry.args += tc.Function.Arguments
 		}
 
-		if choice.FinishReason == openai.FinishReasonToolCalls && pendingToolCall != nil {
-			var args map[string]any
-			if err := json.Unmarshal([]byte(pendingToolArgs), &args); err != nil {
-				// fallback if not valid json
-				args = map[string]any{"raw": pendingToolArgs}
+		if choice.FinishReason == openai.FinishReasonToolCalls {
+			var calls []ToolCall
+			for i := 0; i < len(pendingCalls); i++ {
+				entry, ok := pendingCalls[i]
+				if !ok {
+					continue
+				}
+				var args map[string]any
+				if err := json.Unmarshal([]byte(entry.args), &args); err != nil {
+					args = map[string]any{"raw": entry.args}
+				}
+				calls = append(calls, ToolCall{
+					ID:   entry.id,
+					Name: entry.name,
+					Args: args,
+				})
 			}
-			pendingToolCall.Args = args
-			return pendingToolCall, nil
+			logger.L.Debug("deepseek: tool calls received", "count", len(calls))
+			return calls, nil
 		}
 
 		delta := choice.Delta.Content
@@ -162,4 +193,6 @@ func (d *DeepSeekProvider) StreamChat(ctx context.Context, messages []Message, t
 		case tokenChan <- delta:
 		}
 	}
+
+	return nil, nil
 }

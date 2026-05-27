@@ -1,7 +1,10 @@
 // Package llm defines the LLM provider abstraction layer used by aig.
 package llm
 
-import "context"
+import (
+	"context"
+	"fmt"
+)
 
 // Role constants for conversation messages.
 const (
@@ -22,12 +25,12 @@ type ToolCall struct {
 type Tool struct {
 	Name        string
 	Description string
-	Parameters  any // JSON Schema object (provider specific mapping may be needed, but usually map[string]any works)
+	Parameters  any // JSON Schema object
 }
 
 // Message represents a single turn in a conversation.
 type Message struct {
-	Role       string // RoleUser | RoleAssistant | RoleSystem | RoleTool
+	Role       string     // RoleUser | RoleAssistant | RoleSystem | RoleTool
 	Content    string
 	ToolCalls  []ToolCall // If the assistant called tools
 	ToolCallID string     // If the role is tool, the ID of the call
@@ -35,9 +38,22 @@ type Message struct {
 }
 
 // Provider is the interface all LLM backends must satisfy.
-// StreamChat streams token chunks into tokenChan. If the model invokes a tool,
-// it stops streaming and returns the ToolCall. The caller must execute it,
-// append the result to messages, and call StreamChat again.
+// StreamChat streams token chunks into tokenChan. If the model invokes one or
+// more tools it stops streaming and returns the ToolCalls slice. The caller
+// must execute them, append the results to messages, and call StreamChat again.
 type Provider interface {
-	StreamChat(ctx context.Context, messages []Message, tools []Tool, tokenChan chan<- string) (*ToolCall, error)
+	StreamChat(ctx context.Context, messages []Message, tools []Tool, tokenChan chan<- string) ([]ToolCall, error)
+}
+
+// NewProvider constructs a Provider from a provider name, API key, and model string.
+// This is used for runtime provider/model switching inside the TUI.
+func NewProvider(providerName, apiKey, model string) (Provider, error) {
+	switch providerName {
+	case "gemini":
+		return NewGeminiProvider(apiKey, model)
+	case "deepseek":
+		return NewDeepSeekProvider(apiKey, model)
+	default:
+		return nil, fmt.Errorf("llm: unknown provider %q (valid: gemini, deepseek)", providerName)
+	}
 }

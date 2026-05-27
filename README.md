@@ -23,12 +23,32 @@
 
 ## Features
 
-- 🤖 **Multi-provider** — Gemini (`gemini-2.0-flash`, `gemini-2.5-pro`, …) and DeepSeek (`deepseek-chat`, `deepseek-reasoner`)
-- 🌊 **Streaming TUI** — real-time token streaming via Bubble Tea, non-blocking keyboard listener
-- 📝 **Markdown rendering** — responses rendered through Glamour with dark/light theme auto-detection
-- ⚡ **Secure execution** — detects `bash`/`sh`/`ps1` code blocks, asks for consent, pipes output back to conversation
-- 🖥️ **Cross-platform** — Linux (bash) and Windows (PowerShell) command execution
-- 🎨 **Premium aesthetics** — Catppuccin Mocha palette, rounded borders, smooth status indicators
+### Core Capabilities
+- 🤖 **Multi-Provider & Model Integration** — Support for Google Gemini (official Go SDK, including `gemini-2.0-flash`, `gemini-2.5-pro`, etc.) and DeepSeek (OpenAI-compatible, including `deepseek-v4-flash`, `deepseek-v4-pro`, etc.). Switch providers and models on-the-fly inside the active session.
+- ⚡ **Autonomous Tool-Calling Agent Loop** — Runs multi-turn tool loops sequentially to resolve complex tasks (e.g., read file, search, write/edit file, run test command, repeat).
+- 🌊 **Real-time Streaming TUI** — Built on Bubble Tea and Bubbles, featuring live token streaming, interactive spinners, and status bar updates.
+- 🎨 **Premium Aesthetics** — Custom Catppuccin Mocha themed UI, rounded borders, and dynamic status bars highlighting current state, active model, persona, and auto-approve mode status.
+- 📝 **Live Markdown Rendering** — Renders markdown responses on-the-fly using Glamour with automatic dark/light theme detection.
+- 🖥️ **Cross-Platform** — Native shell/sandbox support for Linux (bash/sh) and Windows (PowerShell) execution.
+
+### Integrated Agent Tools
+The agent can autonomously invoke these tools:
+- 📂 **File Utilities**:
+  - `read_file` — Reads entire files or targeted line-ranges (`start_line`/`end_line`) with a 50KB safety cap.
+  - `write_file` — Overwrites or creates new files (prompts user with a unified diff preview).
+  - `edit_file` — Surgery-grade text replacements using exact old/new snippets (verifies single-match uniqueness and displays a diff).
+  - `list_directory` — Lists entries with file-size information (similar to `ls`).
+- 🔍 **Search & Mapping**:
+  - `search_regex` — Runs recursive regex matching across files (similar to `grep -rn`) with path, line-number, and glob filtering.
+  - `map_workspace` — Generates a tree layout of the workspace to help orient the agent.
+- 🌐 **Web Scraper & Search**:
+  - `web_search` — DuckDuckGo query search returning titles, snippets, and source links.
+  - `web_fetch` — Fetches raw HTML page text, preserves code blocks, strips noise (scripts, CSS, headers, footers), and formats content for documentation reference.
+
+### Safety & Command Sandboxing
+- 🛡️ **Interactive Gating**: Full confirmation dialogs for file mutations (`write_file`, `edit_file`) showing unified diffs.
+- ⚡ **Auto-Approve Mode**: Enable auto-approve (`/approve-tools on` or CLI flag) to execute sandbox commands (`run_command`) autonomously without manual confirmation prompts.
+- 🛑 **Graceful Interrupts**: Cancel active streams or executing sandbox commands safely using `Ctrl+C` without crashing the application.
 
 ---
 
@@ -89,8 +109,8 @@ On first launch, `aig` generates a default `config.json` at:
 aig
 
 # Specify provider and model
-aig --provider deepseek --model deepseek-reasoner
-aig -p deepseek -m deepseek-chat
+aig --provider deepseek --model deepseek-v4-pro
+aig -p deepseek -m deepseek-v4-flash
 
 # Use a custom system prompt persona
 aig --persona sysadmin
@@ -105,16 +125,29 @@ aig -r 20260521-170000
 
 | Command | Action |
 | ------------- | ------------------------------ |
-| `/help` | Display list of available commands |
-| `/history` | List all saved conversation sessions |
+| `/help` or `/?` | Display help menu listing all commands and shortcuts |
+| `/history` | List all saved conversation sessions with timestamps and names |
 | `/load <id>` | Resume a conversation by its session ID |
-| `/save <name>` | Save/rename current session with a friendly name |
-| `/new` | Start a fresh conversation thread |
-| `/clear` | Clear viewport display (keeps system prompt) |
-| `/quit`, `/q` | Exit the application |
-| `Ctrl+C` | Cancel stream or quit |
+| `/save <name>` or `/rename <name>` | Save/rename the current session with a friendly name |
+| `/delete <id>` | Permanently delete a saved conversation |
+| `/new` | Start a fresh conversation thread, resetting history but preserving the persona |
+| `/clear` | Clear the viewport display while retaining the system prompt |
+| `/model` | List available models for the current active provider |
+| `/model <id>` | Switch the active model on-the-fly (keeps conversation history) |
+| `/provider` | List available providers |
+| `/provider <name>` | Switch the active provider on-the-fly (keeps conversation history) |
+| `/persona` | List available personas configured |
+| `/persona <name>` | Switch the system prompt/persona on-the-fly (takes effect on next message) |
+| `/approve-tools on\|off` | Toggle auto-approve mode for commands (shows `⚡auto` badge in status bar when active) |
+| `/map [dir]` | Generates and injects a tree-like map of `[dir]` into the conversation history |
+| `/quit` or `/q` | Exit the application |
+| `Ctrl+C` | Cancel a running command / token stream, or quit |
 | `Enter` | Send message |
-| `Shift+Enter` | Insert newline in text area |
+| `Shift+Enter` | Insert a newline in the text area |
+
+### Inline Macros
+
+- **`/read(path)`**: Attach the content of a file located at `path` directly to the next message context. You can include multiple `/read(...)` macros in a single input message. E.g., `Refactor /read(internal/tui/styles.go) to use Catppuccin theme.`
 
 ---
 
@@ -142,15 +175,40 @@ internal/
 ### State Machine
 
 ```
-INPUT ──[submit]──► STREAMING ──[done]──► INPUT
-                        │
-                   [code block found]
-                        │
-                        ▼
-               CONFIRMING_CMD ──[y]──► EXECUTING_CMD ──► INPUT
-                        │                                  ▲
-                      [n/Esc]                               │
-                        └──────────────────────────────────┘
+            ┌───────────────────────────────────────────────┐
+            ▼                                               │
+ ┌─────────────────────┐                                    │
+ │     stateInput      │                                    │
+ └──────────┬──────────┘                                    │
+            │ [submit]                                      │
+            ▼                                               │
+ ┌─────────────────────┐                                    │
+ │   stateStreaming    ├──────────────[done / no tools]─────┤
+ └──────────┬──────────┘                                    │
+            │                                               │
+      [tool calls]                                          │
+            │                                               │
+            ▼                                               │
+ ┌─────────────────────┐                                    │
+ │ stateExecutingTools │                                    │
+ └──────────┬──────────┘                                    │
+            │                                               │
+            ├───────────────► [Read/Search Tool]            │
+            │                 Executes immediately          │
+            │                                               │
+            ├───────────────► [File Mutation Tool]          │
+            │                 └─► stateConfirmingWrite ──┐  │
+            │                     ├─► [y] ──► Commit ────┤  │
+            │                     └─► [n] ──► Skip ──────┤  │
+            │                                            │  │
+            └───────────────► [run_command Tool]         │  │
+                              ├─► Auto-approve ──────────┼──┤
+                              └─► Confirm Gate ──────────┘  │
+                                  └─► stateConfirmingCmd    │
+                                      ├─► [y]               │
+                                      │   └─► stateExecuting│
+                                      │       └─► Execute ──┤
+                                      └─► [n] ──► Skip ─────┘
 ```
 
 ### Streaming Architecture

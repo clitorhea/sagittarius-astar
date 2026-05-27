@@ -28,6 +28,7 @@ import (
 	"github.com/charmbracelet/glamour"
 	"github.com/charmbracelet/lipgloss"
 
+	"github.com/clitorhea/sagittarius-astar.git/internal/config"
 	"github.com/clitorhea/sagittarius-astar.git/internal/llm"
 	"github.com/clitorhea/sagittarius-astar.git/internal/logger"
 	"github.com/clitorhea/sagittarius-astar.git/internal/sandbox"
@@ -39,11 +40,13 @@ import (
 type state int
 
 const (
-	stateInput         state = iota // Waiting for user to type and submit.
-	stateStreaming                  // LLM is streaming tokens.
-	stateConfirmingCmd              // Awaiting y/n for command execution.
-	stateExecuting                  // Sandbox command is running.
-	stateExecutingTool              // Agent tool is executing autonomously.
+	stateInput             state = iota // Waiting for user to type and submit.
+	stateStreaming                      // LLM is streaming tokens.
+	stateConfirmingCmd                  // Awaiting y/n for command execution.
+	stateExecuting                      // Sandbox command is running.
+	stateExecutingTool                  // Agent tool is executing autonomously.
+	stateExecutingTools                 // Multiple agent tools executing concurrently.
+	stateConfirmingWrite                // Awaiting y/n for write_file tool.
 )
 
 // execLangs are the code fence tags that trigger the sandbox prompt.
@@ -60,6 +63,21 @@ type Model struct {
 	activeSession       *session.Session
 	defaultSystemPrompt string
 
+	// Provider / model identity (for status bar)
+	activeProvider string
+	activeModel    string
+
+	// Runtime switching — API keys per provider, personas from config
+	apiKeys    map[string]string  // provider name → API key
+	fileConfig *config.FileConfig // parsed config, for persona resolution
+
+	// autoApproveCommands skips the confirmation dialog for run_command tool calls.
+	autoApproveCommands bool
+
+	// pendingToolCalls holds the full batch returned by the LLM for sequential processing.
+	pendingToolCalls []llm.ToolCall
+	pendingToolIdx   int // index of the next call to process in pendingToolCalls
+
 	// Streaming state
 	tokenChan    chan string
 	streamBuffer string // accumulates tokens during streaming
@@ -69,11 +87,18 @@ type Model struct {
 	pendingCmd  string
 	pendingLang string
 
+	// cancelExec cancels a running sandbox child process without quitting the app.
+	cancelExec context.CancelFunc
+
+	// Pending write_file confirmation
+	pendingWrite *PendingWrite
+	pendingWriteCallID string
+
 	// UI components
 	textarea    textarea.Model
 	cmdTextarea textarea.Model
 	viewport    viewport.Model
-	spinner  spinner.Model
+	spinner     spinner.Model
 
 	// Layout
 	width  int
@@ -90,10 +115,13 @@ type Model struct {
 
 	// App version string
 	appVersion string
+
+	// showHelp displays the keybind/command overlay.
+	showHelp bool
 }
 
 // NewModel constructs a new TUI model wired to the given LLM provider and session.
-func NewModel(provider llm.Provider, activeSession *session.Session, defaultSystemPrompt string, appVersion string) (*Model, error) {
+func NewModel(provider llm.Provider, activeSession *session.Session, defaultSystemPrompt string, appVersion string, providerName string, modelName string, apiKeys map[string]string) (*Model, error) {
 	// Text area
 	ta := textarea.New()
 	ta.Placeholder = "Ask anything… (Enter to send, Shift+Enter for newline, /help for commands)"
@@ -127,6 +155,10 @@ func NewModel(provider llm.Provider, activeSession *session.Session, defaultSyst
 		return nil, fmt.Errorf("tui: failed to create glamour renderer: %w", err)
 	}
 
+	if apiKeys == nil {
+		apiKeys = make(map[string]string)
+	}
+
 	m := &Model{
 		appState:            stateInput,
 		history:             activeSession.History,
@@ -139,6 +171,10 @@ func NewModel(provider llm.Provider, activeSession *session.Session, defaultSyst
 		activeSession:       activeSession,
 		defaultSystemPrompt: defaultSystemPrompt,
 		appVersion:          appVersion,
+		activeProvider:      providerName,
+		activeModel:         modelName,
+		apiKeys:             apiKeys,
+		fileConfig:          config.LoadFileConfig(),
 	}
 
 	return m, nil
@@ -201,10 +237,15 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 						return m, tea.Quit
 					}
 
-					// Clear display (does not wipe history in db, just display)
+					// Clear display: trim history to system-prompt-only, avoiding
+					// orphaned tool messages that would cause API errors on next call.
 					if input == "/clear" {
 						m.outputLines = nil
-						m.history = m.history[:min(1, len(m.history))] // keep system prompt
+						if len(m.history) > 0 && m.history[0].Role == llm.RoleSystem {
+							m.history = m.history[:1]
+						} else {
+							m.history = nil
+						}
 						m.saveSession()
 						m.refreshViewport()
 						break
@@ -212,13 +253,30 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 					// Help manual
 					if input == "/help" || input == "/?" {
-						m.appendOutput(lipgloss.NewStyle().Foreground(colorAccent).Bold(true).Render("Available commands:"))
-						m.appendOutput("  /history       List all saved conversations")
-						m.appendOutput("  /load <id>     Resume a conversation by its ID")
-						m.appendOutput("  /save <name>   Give the current conversation a friendly name")
-						m.appendOutput("  /new           Start a fresh conversation thread")
-						m.appendOutput("  /clear         Clear display output (keeps system prompt)")
-						m.appendOutput("  /quit, /q      Exit the application")
+						m.appendOutput(lipgloss.NewStyle().Foreground(colorAccent).Bold(true).Render("Commands:"))
+						m.appendOutput("  /history           List all saved conversations")
+						m.appendOutput("  /load <id>         Resume a conversation by its ID")
+						m.appendOutput("  /save <name>       Give the current conversation a friendly name")
+						m.appendOutput("  /delete <id>       Permanently delete a saved conversation")
+						m.appendOutput("  /map [dir]         Inject workspace tree into context")
+						m.appendOutput("  /new               Start a fresh conversation thread")
+						m.appendOutput("  /clear             Clear display output (keeps system prompt)")
+						m.appendOutput("  /model             List available models for current provider")
+						m.appendOutput("  /model <id>        Switch active model (keeps history)")
+						m.appendOutput("  /provider          List available providers")
+						m.appendOutput("  /provider <name>   Switch active provider (keeps history)")
+						m.appendOutput("  /persona           List available personas")
+						m.appendOutput("  /persona <name>    Switch system prompt persona")
+						m.appendOutput("  /approve-tools on  Auto-execute agent run_command calls")
+						m.appendOutput("  /approve-tools off Require confirmation per command (default)")
+						m.appendOutput("  /quit, /q          Exit the application")
+						m.appendOutput(lipgloss.NewStyle().Foreground(colorAccent).Bold(true).Render("Keyboard shortcuts:"))
+						m.appendOutput("  Enter              Send message")
+						m.appendOutput("  Shift+Enter        Insert newline")
+						m.appendOutput("  Ctrl+C             Cancel stream / quit")
+						m.appendOutput("  Ctrl+L             Clear viewport")
+						m.appendOutput("  ?                  Toggle this help overlay")
+						m.appendOutput("  /read(file)        Attach file content to next message")
 						m.refreshViewport()
 						break
 					}
@@ -244,6 +302,28 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 								m.appendOutput(lipgloss.NewStyle().Foreground(colorText).Render(line))
 							}
 							m.appendOutput(lipgloss.NewStyle().Foreground(colorSubtext).Render("Use /load <id> to resume a thread, or /new to start fresh."))
+						}
+						m.refreshViewport()
+						break
+					}
+
+					// Delete session
+					if strings.HasPrefix(input, "/delete ") {
+						id := strings.TrimSpace(strings.TrimPrefix(input, "/delete "))
+						if id == "" {
+							m.appendOutput(errorStyle.Render("✗ Please specify a session ID (e.g. /delete 20260521-120000)"))
+							m.refreshViewport()
+							break
+						}
+						if m.activeSession != nil && id == m.activeSession.ID {
+							m.appendOutput(errorStyle.Render("✗ Cannot delete the active session. Start a /new session first."))
+							m.refreshViewport()
+							break
+						}
+						if err := session.Delete(id); err != nil {
+							m.appendOutput(errorStyle.Render("✗ Failed to delete session: " + err.Error()))
+						} else {
+							m.appendOutput(lipgloss.NewStyle().Foreground(colorGreen).Render("🗑 Deleted session: " + id))
 						}
 						m.refreshViewport()
 						break
@@ -309,7 +389,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 								Content: fmt.Sprintf("Workspace Map for '%s':\n```\n%s\n```", dir, tree),
 							})
 							m.saveSession()
-							m.appendOutput(lipgloss.NewStyle().Foreground(colorSubtext).Render(fmt.Sprintf("🗺️ Mapped workspace %s", dir)))
+							m.appendOutput(lipgloss.NewStyle().Foreground(colorSubtext).Render(fmt.Sprintf("🗺️  Mapped workspace %s", dir)))
 						}
 						m.refreshViewport()
 						break
@@ -335,11 +415,174 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 						break
 					}
 
-					// Unknown command fallback
-					m.appendOutput(errorStyle.Render("✗ Unknown command. Type /help to see available commands."))
+					// ── /model [name] ──────────────────────────────────────────
+				if strings.HasPrefix(input, "/model") {
+					arg := strings.TrimSpace(strings.TrimPrefix(input, "/model"))
+
+					if arg == "" {
+						// List available models for current provider
+						prov := config.ProviderName(m.activeProvider)
+						models, ok := config.KnownModels[prov]
+						m.appendOutput(lipgloss.NewStyle().Foreground(colorAccent).Bold(true).Render(
+							fmt.Sprintf("Models for %s:", m.activeProvider)))
+						if ok {
+							for _, pair := range models {
+								marker := "  "
+								if pair[0] == m.activeModel {
+									marker = lipgloss.NewStyle().Foreground(colorGreen).Render("▶ ")
+								}
+								m.appendOutput(fmt.Sprintf("%s%-30s %s",
+									marker,
+									lipgloss.NewStyle().Foreground(colorText).Render(pair[0]),
+									lipgloss.NewStyle().Foreground(colorSubtext).Render(pair[1]),
+								))
+							}
+						} else {
+							m.appendOutput(lipgloss.NewStyle().Foreground(colorSubtext).Render("  (no known models for this provider)"))
+						}
+						m.appendOutput(lipgloss.NewStyle().Foreground(colorSubtext).Render("Usage: /model <id>"))
+						m.refreshViewport()
+						break
+					}
+
+					// Switch to the named model (keep provider, keep history)
+					apiKey, hasKey := m.apiKeys[m.activeProvider]
+					if !hasKey || apiKey == "" {
+						m.appendOutput(errorStyle.Render(fmt.Sprintf("✗ No API key stored for provider %q", m.activeProvider)))
+						m.refreshViewport()
+						break
+					}
+					newProvider, err := llm.NewProvider(m.activeProvider, apiKey, arg)
+					if err != nil {
+						m.appendOutput(errorStyle.Render("✗ Failed to switch model: " + err.Error()))
+					} else {
+						m.provider = newProvider
+						m.activeModel = arg
+						if m.activeSession != nil {
+							m.activeSession.Model = arg
+							m.saveSession()
+						}
+						m.appendOutput(lipgloss.NewStyle().Foreground(colorGreen).Render(
+							fmt.Sprintf("✓ Switched to model: %s", arg)))
+					}
 					m.refreshViewport()
 					break
 				}
+
+				// ── /provider [name] ───────────────────────────────────────
+				if strings.HasPrefix(input, "/provider") {
+					arg := strings.TrimSpace(strings.TrimPrefix(input, "/provider"))
+
+					if arg == "" {
+						// List providers
+						providers := []string{"gemini", "deepseek"}
+						m.appendOutput(lipgloss.NewStyle().Foreground(colorAccent).Bold(true).Render("Available providers:"))
+						for _, p := range providers {
+							marker := "  "
+							if p == m.activeProvider {
+								marker = lipgloss.NewStyle().Foreground(colorGreen).Render("▶ ")
+							}
+							m.appendOutput(marker + lipgloss.NewStyle().Foreground(colorText).Render(p))
+						}
+						m.appendOutput(lipgloss.NewStyle().Foreground(colorSubtext).Render("Usage: /provider <name>"))
+						m.refreshViewport()
+						break
+					}
+
+					arg = strings.ToLower(arg)
+					apiKey, hasKey := m.apiKeys[arg]
+					if !hasKey || apiKey == "" {
+						m.appendOutput(errorStyle.Render(fmt.Sprintf(
+							"✗ No API key configured for %q. Set it in ~/.config/aig/config.json or via environment variable.", arg)))
+						m.refreshViewport()
+						break
+					}
+					defaultModel := string(config.DefaultModel(config.ProviderName(arg)))
+					newProvider, err := llm.NewProvider(arg, apiKey, defaultModel)
+					if err != nil {
+						m.appendOutput(errorStyle.Render("✗ Failed to switch provider: " + err.Error()))
+					} else {
+						m.provider = newProvider
+						m.activeProvider = arg
+						m.activeModel = defaultModel
+						if m.activeSession != nil {
+							m.activeSession.Provider = arg
+							m.activeSession.Model = defaultModel
+							m.saveSession()
+						}
+						m.appendOutput(lipgloss.NewStyle().Foreground(colorGreen).Render(
+							fmt.Sprintf("✓ Switched to provider: %s  model: %s", arg, defaultModel)))
+					}
+					m.refreshViewport()
+					break
+				}
+
+				// ── /persona [name] ────────────────────────────────────────
+				if strings.HasPrefix(input, "/persona") {
+					arg := strings.TrimSpace(strings.TrimPrefix(input, "/persona"))
+
+					if arg == "" {
+						// List available personas
+						names := config.PersonaList(m.fileConfig)
+						m.appendOutput(lipgloss.NewStyle().Foreground(colorAccent).Bold(true).Render("Available personas:"))
+						for _, name := range names {
+							m.appendOutput("  " + lipgloss.NewStyle().Foreground(colorText).Render(name))
+						}
+						m.appendOutput(lipgloss.NewStyle().Foreground(colorSubtext).Render("Usage: /persona <name>"))
+						m.refreshViewport()
+						break
+					}
+
+					prompt, ok := config.ResolvePersona(arg, m.fileConfig)
+					if !ok {
+						m.appendOutput(errorStyle.Render(fmt.Sprintf("✗ Unknown persona %q. Type /persona to list available.", arg)))
+						m.refreshViewport()
+						break
+					}
+
+					m.defaultSystemPrompt = prompt
+					// Replace or prepend the leading system message in history
+					if len(m.history) > 0 && m.history[0].Role == llm.RoleSystem {
+						m.history[0].Content = prompt
+					} else {
+						m.history = append([]llm.Message{{Role: llm.RoleSystem, Content: prompt}}, m.history...)
+					}
+					m.saveSession()
+					m.appendOutput(lipgloss.NewStyle().Foreground(colorGreen).Render(
+						fmt.Sprintf("✓ Persona switched to %q (effective next message)", arg)))
+					m.refreshViewport()
+					break
+				}
+
+				// ── /approve-tools on|off ──────────────────────────────────────
+				if strings.HasPrefix(input, "/approve-tools") {
+					arg := strings.TrimSpace(strings.TrimPrefix(input, "/approve-tools"))
+					switch arg {
+					case "on", "1", "yes":
+						m.autoApproveCommands = true
+						m.appendOutput(lipgloss.NewStyle().Foreground(colorYellow).Bold(true).Render(
+							"⚡ Auto-approve enabled — run_command will execute without prompting."))
+					case "off", "0", "no":
+						m.autoApproveCommands = false
+						m.appendOutput(lipgloss.NewStyle().Foreground(colorGreen).Render(
+							"✓ Auto-approve disabled — commands require confirmation."))
+					default:
+						status := "off"
+						if m.autoApproveCommands {
+							status = "on"
+						}
+						m.appendOutput(lipgloss.NewStyle().Foreground(colorSubtext).Render(
+							fmt.Sprintf("Auto-approve is currently: %s. Use /approve-tools on|off", status)))
+					}
+					m.refreshViewport()
+					break
+				}
+
+				// Unknown command fallback
+				m.appendOutput(errorStyle.Render("✗ Unknown command. Type /help to see available commands."))
+				m.refreshViewport()
+				break
+			}
 
 				// Standard user prompt submission
 				m.textarea.Reset()
@@ -352,6 +595,33 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 			case tea.KeyCtrlC:
 				return m, tea.Quit
+
+			case tea.KeyCtrlL:
+				// Clear viewport (same as /clear) without wiping history
+				m.outputLines = nil
+				if len(m.history) > 0 && m.history[0].Role == llm.RoleSystem {
+					m.history = m.history[:1]
+				} else {
+					m.history = nil
+				}
+				m.saveSession()
+				m.refreshViewport()
+				return m, nil
+			}
+
+			// '?' toggles the inline help overlay
+			if msg.String() == "?" && m.textarea.Value() == "" {
+				m.showHelp = !m.showHelp
+				if m.showHelp {
+					m.appendOutput(helpOverlay())
+				} else {
+					// Remove the last help block (trim until we hit a divider)
+					for len(m.outputLines) > 0 && !strings.HasPrefix(m.outputLines[len(m.outputLines)-1], "─") {
+						m.outputLines = m.outputLines[:len(m.outputLines)-1]
+					}
+				}
+				m.refreshViewport()
+				return m, nil
 			}
 
 		case stateStreaming:
@@ -371,6 +641,20 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			switch msg.Type {
 			case tea.KeyEsc:
 				logger.L.Info("sandbox: user declined execution", "lang", m.pendingLang)
+				// If this was a run_command tool call, return an error result
+				// so the batch loop can continue with the next tool.
+				if m.pendingLang == "" && len(m.pendingToolCalls) > 0 {
+					call := m.pendingToolCalls[m.pendingToolIdx]
+				m.appState = stateInput
+					m.cmdTextarea.Blur()
+					m.textarea.Focus()
+					m.appendOutput(confirmStyle.Render("✗ Command skipped."))
+					m.refreshViewport()
+					return m, func() tea.Msg {
+						return toolCallResultMsg{CallID: call.ID, Name: call.Name,
+							Result: "Command skipped by user."}
+					}
+				}
 				m.appState = stateInput
 				m.cmdTextarea.Blur()
 				m.textarea.Focus()
@@ -382,6 +666,30 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				if cmd == "" {
 					return m, nil
 				}
+				// Tool-call run_command path (pendingLang == ""):
+				// run the command and feed the output back as a toolCallResultMsg.
+				if m.pendingLang == "" && len(m.pendingToolCalls) > 0 {
+					call := m.pendingToolCalls[m.pendingToolIdx]
+					logger.L.Info("run_command tool: user approved", "command", cmd)
+					m.appState = stateExecutingTool
+					m.cmdTextarea.Blur()
+					m.appendOutput(confirmStyle.Render("⚡ Executing…"))
+					m.refreshViewport()
+					// Patch the command in case the user edited it.
+					callCopy := call
+					callCopy.Args["command"] = cmd
+					ctx, cancel := context.WithCancel(context.Background())
+					m.cancelExec = cancel
+					return m, func() tea.Msg {
+						out, err := ExecuteRunCommand(ctx, callCopy)
+						cancel()
+						if err != nil {
+							return toolCallResultMsg{CallID: callCopy.ID, Name: callCopy.Name, Error: err}
+						}
+						return toolCallResultMsg{CallID: callCopy.ID, Name: callCopy.Name, Result: out}
+					}
+				}
+				// Code-fence sandbox path.
 				logger.L.Info("sandbox: user approved execution",
 					"lang", m.pendingLang,
 					"command", cmd,
@@ -401,9 +709,65 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, cmd
 
 		case stateExecuting:
+			// Ctrl+C kills the child process without quitting aig.
 			if msg.Type == tea.KeyCtrlC {
+				if m.cancelExec != nil {
+					m.cancelExec()
+					m.cancelExec = nil
+				}
+				logger.L.Warn("sandbox: execution killed by user")
+				m.appState = stateInput
+				m.appendOutput(errorStyle.Render("✗ Command killed."))
+				m.refreshViewport()
+				return m, nil
+			}
+
+		case stateConfirmingWrite:
+			switch msg.Type {
+			case tea.KeyEnter:
+				// 'y' + Enter or just Enter when 'y' is pre-filled confirms the write.
+				cmd := strings.ToLower(strings.TrimSpace(m.cmdTextarea.Value()))
+				if cmd != "y" && cmd != "yes" {
+					m.appendOutput(confirmStyle.Render("✗ Write cancelled."))
+					m.pendingWrite = nil
+					m.pendingWriteCallID = ""
+					m.appState = stateInput
+					m.cmdTextarea.Blur()
+					m.textarea.Focus()
+					m.refreshViewport()
+					return m, nil
+				}
+				pw := m.pendingWrite
+				callID := m.pendingWriteCallID
+				m.pendingWrite = nil
+				m.pendingWriteCallID = ""
+				m.appState = stateExecutingTool
+				m.cmdTextarea.Blur()
+				m.textarea.Focus()
+				m.appendOutput(confirmStyle.Render("✍  Writing file…"))
+				m.refreshViewport()
+				return m, func() tea.Msg {
+					if err := CommitWrite(*pw); err != nil {
+						return toolCallResultMsg{CallID: callID, Name: "write_file", Error: err}
+					}
+					return toolCallResultMsg{CallID: callID, Name: "write_file", Result: fmt.Sprintf("Successfully wrote %s", pw.Path)}
+				}
+			case tea.KeyEsc:
+				m.pendingWrite = nil
+				m.pendingWriteCallID = ""
+				m.appState = stateInput
+				m.cmdTextarea.Blur()
+				m.textarea.Focus()
+				m.appendOutput(confirmStyle.Render("✗ Write cancelled."))
+				m.refreshViewport()
+				return m, nil
+			case tea.KeyCtrlC:
 				return m, tea.Quit
 			}
+
+			var cmd tea.Cmd
+			m.cmdTextarea, cmd = m.cmdTextarea.Update(msg)
+			return m, cmd
 		}
 
 	// ── Streaming token received ───────────────────────────────────────────
@@ -502,29 +866,37 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.refreshViewport()
 		return m, nil
 
-	// ── Tool execution result ──────────────────────────────────────────────
-	case toolCallMsg:
-		m.appState = stateExecutingTool
-
+	// ── Tool batch received from LLM ───────────────────────────────────────
+	case toolCallBatchMsg:
+		// Clear the "…" streaming placeholder.
 		if len(m.outputLines) > 0 && strings.Contains(m.outputLines[len(m.outputLines)-1], "…") {
 			m.outputLines = m.outputLines[:len(m.outputLines)-1]
 		}
 
-		m.appendOutput(lipgloss.NewStyle().Foreground(colorYellow).Render(fmt.Sprintf("⚙ Executing tool: %s", msg.Call.Name)))
-		m.refreshViewport()
+		calls := msg.Calls
+		if len(calls) == 0 {
+			m.appState = stateInput
+			m.refreshViewport()
+			return m, nil
+		}
 
+		// Record the full assistant turn (all tool calls in one message).
+		assistantTCs := make([]llm.ToolCall, len(calls))
+		copy(assistantTCs, calls)
 		m.history = append(m.history, llm.Message{
 			Role:      llm.RoleAssistant,
-			ToolCalls: []llm.ToolCall{msg.Call},
+			ToolCalls: assistantTCs,
 		})
 
-		call := msg.Call
+		// Store the batch and start processing from index 0.
+		m.pendingToolCalls = calls
+		m.pendingToolIdx = 0
+		return m, m.processNextToolCall()
+
+	// ── Legacy single-tool path (kept for safety) ──────────────────────────
+	case toolCallMsg:
 		return m, func() tea.Msg {
-			resultStr, err := ExecuteTool(call)
-			if err != nil {
-				return toolCallResultMsg{CallID: call.ID, Name: call.Name, Result: "", Error: err}
-			}
-			return toolCallResultMsg{CallID: call.ID, Name: call.Name, Result: resultStr, Error: nil}
+			return toolCallBatchMsg{Calls: []llm.ToolCall{msg.Call}}
 		}
 
 	case toolCallResultMsg:
@@ -533,7 +905,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			resContent = fmt.Sprintf("Error: %s", msg.Error.Error())
 			m.appendOutput(errorStyle.Render(fmt.Sprintf("✗ Tool %s failed", msg.Name)))
 		} else {
-			m.appendOutput(lipgloss.NewStyle().Foreground(colorGreen).Render(fmt.Sprintf("✓ Tool %s succeeded", msg.Name)))
+			m.appendOutput(lipgloss.NewStyle().Foreground(colorGreen).Render(fmt.Sprintf("✓ Tool %s done", msg.Name)))
 		}
 		m.refreshViewport()
 
@@ -545,6 +917,14 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		})
 		m.saveSession()
 
+		// Advance to the next tool in the batch, or re-stream if all done.
+		m.pendingToolIdx++
+		if m.pendingToolIdx < len(m.pendingToolCalls) {
+			return m, m.processNextToolCall()
+		}
+		// All tools in this batch are done — give the LLM the full results.
+		m.pendingToolCalls = nil
+		m.pendingToolIdx = 0
 		return m, tea.Batch(m.startStreaming()...)
 	}
 
@@ -598,19 +978,42 @@ func (m Model) View() string {
 			m.spinner.View() + " " + lipgloss.NewStyle().Foreground(colorSubtext).Render("streaming…"),
 		))
 	case stateConfirmingCmd:
+		var label string
+		if m.pendingLang != "" {
+			label = fmt.Sprintf("Review %s block (Enter to run, Esc to cancel, Shift+Enter for newline):", m.pendingLang)
+		} else {
+			label = "Review command (Enter to run, Esc to cancel, Shift+Enter for newline):"
+		}
 		b.WriteString(inputActiveStyle.Render(
 			lipgloss.JoinVertical(lipgloss.Left,
-				confirmStyle.Render(fmt.Sprintf("Review %s block (Enter to run, Esc to cancel, Shift+Enter for newline):", m.pendingLang)),
+				confirmStyle.Render(label),
+				m.cmdTextarea.View(),
+			),
+		))
+	case stateConfirmingWrite:
+		path := ""
+		if m.pendingWrite != nil {
+			path = m.pendingWrite.Path
+		}
+		b.WriteString(inputActiveStyle.Render(
+			lipgloss.JoinVertical(lipgloss.Left,
+				confirmStyle.Render(fmt.Sprintf("💾 Write to %s? Type 'y' and Enter to confirm, Esc to cancel:", path)),
 				m.cmdTextarea.View(),
 			),
 		))
 	case stateExecuting:
 		b.WriteString(inputStyle.Render(
-			m.spinner.View() + " " + lipgloss.NewStyle().Foreground(colorSubtext).Render("running command…"),
+			m.spinner.View() + " " + lipgloss.NewStyle().Foreground(colorSubtext).Render("running command… (Ctrl+C to kill)"),
 		))
 	case stateExecutingTool:
 		b.WriteString(inputStyle.Render(
 			m.spinner.View() + " " + lipgloss.NewStyle().Foreground(colorSubtext).Render("executing tool…"),
+		))
+	case stateExecutingTools:
+		remaining := len(m.pendingToolCalls) - m.pendingToolIdx
+		b.WriteString(inputStyle.Render(
+			m.spinner.View() + " " + lipgloss.NewStyle().Foreground(colorSubtext).Render(
+				fmt.Sprintf("executing tools… (%d remaining)", remaining)),
 		))
 	}
 
@@ -721,12 +1124,12 @@ func (m *Model) startStreaming() []tea.Cmd {
 	streamCmd := func() tea.Msg {
 		// Prune to a default context limit (100k tokens approx ~400k chars)
 		prunedHistory := llm.PruneHistory(m.history, 100000)
-		toolCall, err := m.provider.StreamChat(ctx, prunedHistory, AgentTools(), ch)
+		toolCalls, err := m.provider.StreamChat(ctx, prunedHistory, AgentTools(), ch)
 		if err != nil {
 			return streamErrMsg{err: err}
 		}
-		if toolCall != nil {
-			return toolCallMsg{Call: *toolCall}
+		if len(toolCalls) > 0 {
+			return toolCallBatchMsg{Calls: toolCalls}
 		}
 		return streamDoneMsg{}
 	}
@@ -753,16 +1156,128 @@ func waitForToken(ch chan string) tea.Cmd {
 }
 
 // runSandboxCmd executes the pending command in the sandbox.
+// It creates a cancellable context and stores the cancel func so the TUI
+// can kill the child process on Ctrl+C without quitting the whole app.
 func (m *Model) runSandboxCmd() tea.Cmd {
 	cmd := m.pendingCmd
+	ctx, cancel := context.WithCancel(context.Background())
+	m.cancelExec = cancel
 	return func() tea.Msg {
-		result, err := sandbox.Execute(context.Background(), cmd)
+		result, err := sandbox.Execute(ctx, cmd)
 		if err != nil {
 			return execResultMsg{err: err}
 		}
 		return execResultMsg{output: result.Combined()}
 	}
 }
+
+// processNextToolCall picks up the next call in pendingToolCalls and routes it:
+//   - run_command   → auto-approve (execute now) or stateConfirmingCmd
+//   - write_file / edit_file → stateConfirmingWrite with diff preview
+//   - everything else → execute immediately, return toolCallResultMsg
+func (m *Model) processNextToolCall() tea.Cmd {
+	if m.pendingToolIdx >= len(m.pendingToolCalls) {
+		return func() tea.Msg { return toolCallResultMsg{} }
+	}
+	call := m.pendingToolCalls[m.pendingToolIdx]
+
+	switch call.Name {
+	case "run_command":
+		command, _ := call.Args["command"].(string)
+
+		if m.autoApproveCommands {
+			// Execute immediately without asking.
+			m.appState = stateExecutingTool
+			m.appendOutput(lipgloss.NewStyle().Foreground(colorYellow).Render(
+				fmt.Sprintf("⚡ run_command (auto): %s", command)))
+			m.refreshViewport()
+			callCopy := call
+			ctx, cancel := context.WithCancel(context.Background())
+			m.cancelExec = cancel
+			return func() tea.Msg {
+				out, err := ExecuteRunCommand(ctx, callCopy)
+				cancel()
+				if err != nil {
+					return toolCallResultMsg{CallID: callCopy.ID, Name: callCopy.Name, Error: err}
+				}
+				return toolCallResultMsg{CallID: callCopy.ID, Name: callCopy.Name, Result: out}
+			}
+		}
+
+		// Prompt the user — reuse stateConfirmingCmd.
+		m.appState = stateConfirmingCmd
+		m.pendingCmd = command
+		m.pendingLang = "" // signals "tool call, not a code-fence"
+		m.cmdTextarea.SetValue(command)
+		m.textarea.Blur()
+		m.cmdTextarea.Focus()
+		m.appendOutput(confirmStyle.Render(fmt.Sprintf("🔧 run_command: %s", command)))
+		m.appendOutput(lipgloss.NewStyle().Foreground(colorSubtext).Render(
+			"Enter to execute · Esc to cancel · edit command if needed"))
+		m.refreshViewport()
+		// Return nil — execution continues when the user presses Enter (handled in
+		// stateConfirmingCmd KeyEnter, which calls runSandboxCmd → execResultMsg).
+		// But we need to deliver the result back as a toolCallResultMsg, not execResultMsg.
+		// So we set a special pending state marker here and intercept in execResultMsg handler.
+		// Simpler: in stateConfirmingCmd Enter, detect pendingLang=="" to know it's a tool call.
+		return nil
+
+	case "write_file", "edit_file":
+		_, pw, _ := ExecuteToolWithWrite(call)
+		if pw == nil {
+			// Shouldn't happen, but guard.
+			return func() tea.Msg {
+				return toolCallResultMsg{CallID: call.ID, Name: call.Name, Error: fmt.Errorf("%s: failed to prepare write", call.Name)}
+			}
+		}
+		m.pendingWrite = pw
+		m.pendingWriteCallID = call.ID
+
+		icon := "💾"
+		if call.Name == "edit_file" {
+			icon = "✏️ "
+		}
+		m.appendOutput(lipgloss.NewStyle().Foreground(colorYellow).Bold(true).Render(
+			fmt.Sprintf("%s %s: %s", icon, call.Name, pw.Path)))
+
+		// Show diff if available, otherwise show content preview.
+		if pw.Diff != "" && pw.Diff != "(no changes)" {
+			m.appendOutput(lipgloss.NewStyle().Foreground(colorSubtext).Render("Diff preview:"))
+			m.appendOutput(codeBlockStyle.Render(pw.Diff))
+		} else {
+			preview := pw.Content
+			if len(preview) > 400 {
+				preview = preview[:400] + "\n...(truncated)"
+			}
+			m.appendOutput(lipgloss.NewStyle().Foreground(colorSubtext).Render(
+				fmt.Sprintf("Content preview (%d bytes):", len(pw.Content))))
+			m.appendOutput(codeBlockStyle.Render(preview))
+		}
+
+		m.appState = stateConfirmingWrite
+		m.cmdTextarea.SetValue("y")
+		m.textarea.Blur()
+		m.cmdTextarea.Focus()
+		m.refreshViewport()
+		return nil
+
+	default:
+		// Safe read-only or web tools: execute immediately.
+		m.appState = stateExecutingTool
+		m.appendOutput(lipgloss.NewStyle().Foreground(colorYellow).Render(
+			fmt.Sprintf("⚙ Tool: %s", call.Name)))
+		m.refreshViewport()
+		callCopy := call
+		return func() tea.Msg {
+			resultStr, _, err := ExecuteToolWithWrite(callCopy)
+			if err != nil {
+				return toolCallResultMsg{CallID: callCopy.ID, Name: callCopy.Name, Error: err}
+			}
+			return toolCallResultMsg{CallID: callCopy.ID, Name: callCopy.Name, Result: resultStr}
+		}
+	}
+}
+
 
 // refreshViewport re-renders all output lines into the viewport.
 func (m *Model) refreshViewport() {
@@ -790,7 +1305,7 @@ func (m *Model) appendOutput(line string) {
 	m.outputLines = append(m.outputLines, line)
 }
 
-// statusBar renders the bottom status bar.
+// statusBar renders the bottom status bar with state, session, token count, and model info.
 func (m Model) statusBar() string {
 	var statusText string
 	switch m.appState {
@@ -799,33 +1314,104 @@ func (m Model) statusBar() string {
 	case stateConfirmingCmd:
 		statusText = "⚠ awaiting confirmation"
 	case stateExecuting:
-		statusText = "⚙ executing command"
+		statusText = "⛔ executing command"
 	case stateExecutingTool:
 		statusText = "⚙ executing tool"
+	case stateConfirmingWrite:
+		statusText = "💾 write pending"
 	default:
 		statusText = "● ready"
 	}
 
-	// Show active session ID in status bar
+	// Session name
 	sessionInfo := ""
 	if m.activeSession != nil {
 		name := m.activeSession.Name
 		if name == "" {
 			name = "Untitled"
 		}
-		sessionInfo = fmt.Sprintf("session: %s (%s)", m.activeSession.ID, name)
+		sessionInfo = fmt.Sprintf("[%s]", name)
 	}
 
+	// Estimated token count
+	tokenCount := llm.EstimateHistoryTokens(m.history)
+	tokenInfo := fmt.Sprintf("~%dk tokens", tokenCount/1000)
+	if tokenCount < 1000 {
+		tokenInfo = fmt.Sprintf("~%d tokens", tokenCount)
+	}
+
+	// Provider + model info
+	modelInfo := ""
+	if m.activeProvider != "" || m.activeModel != "" {
+		modelInfo = fmt.Sprintf("%s/%s", m.activeProvider, m.activeModel)
+	}
+
+	// Auto-approve badge
+	autoTag := ""
+	if m.autoApproveCommands {
+		autoTag = lipgloss.NewStyle().Foreground(colorYellow).Bold(true).Render("⚡auto")
+	}
+
+	// Left side: status · session
 	leftText := statusText
 	if sessionInfo != "" {
 		leftText = fmt.Sprintf("%s · %s", statusText, sessionInfo)
 	}
 
-	padding := m.width - lipgloss.Width(leftText) - 4
+	// Right side: tokens · model · auto badge · help hint
+	rightParts := []string{}
+	if tokenInfo != "" {
+		rightParts = append(rightParts, lipgloss.NewStyle().Foreground(colorSubtext).Render(tokenInfo))
+	}
+	if modelInfo != "" {
+		rightParts = append(rightParts, lipgloss.NewStyle().Foreground(colorOverlay).Render(modelInfo))
+	}
+	if autoTag != "" {
+		rightParts = append(rightParts, autoTag)
+	}
+	rightParts = append(rightParts, lipgloss.NewStyle().Foreground(colorSubtext).Render("? help"))
+	rightText := strings.Join(rightParts, " · ")
+
+	padding := m.width - lipgloss.Width(leftText) - lipgloss.Width(rightText) - 4
 	if padding < 0 {
 		padding = 0
 	}
 	spacer := strings.Repeat(" ", padding)
-	help := lipgloss.NewStyle().Foreground(colorSubtext).Render("ctrl+c quit · /help menu")
-	return statusBarStyle.Width(m.width).Render(leftText + spacer + help)
+	return statusBarStyle.Width(m.width).Render(leftText + spacer + rightText)
+}
+
+// helpOverlay returns a formatted help block to append to outputLines.
+func helpOverlay() string {
+	header := lipgloss.NewStyle().Foreground(colorAccent).Bold(true).Render("❓ Keyboard Shortcuts & Commands")
+	lines := []string{
+		header,
+		lipgloss.NewStyle().Foreground(colorAccent).Render("  Shortcuts"),
+		"  Enter           Send message",
+		"  Shift+Enter     Insert newline",
+		"  Ctrl+C          Cancel stream / kill command / quit",
+		"  Ctrl+L          Clear viewport",
+		"  ?               Toggle this help",
+		lipgloss.NewStyle().Foreground(colorAccent).Render("  Session Commands"),
+		"  /history        List saved sessions",
+		"  /load <id>      Resume session",
+		"  /save <name>    Rename session",
+		"  /delete <id>    Delete session",
+		"  /map [dir]      Map workspace into context",
+		"  /new            Fresh session",
+		"  /clear          Clear viewport",
+		"  /quit           Exit",
+		lipgloss.NewStyle().Foreground(colorAccent).Render("  Runtime Switching"),
+		"  /model          List models for current provider",
+		"  /model <id>     Switch model (keeps history)",
+		"  /provider       List providers",
+		"  /provider <n>   Switch provider (keeps history)",
+		"  /persona        List personas",
+		"  /persona <n>    Switch system prompt persona",
+		lipgloss.NewStyle().Foreground(colorAccent).Render("  Agent Execution"),
+		"  /approve-tools on   Auto-execute run_command without prompting",
+		"  /approve-tools off  Require confirmation for every command (default)",
+		lipgloss.NewStyle().Foreground(colorAccent).Render("  File macros"),
+		"  /read(path)     Attach file content to next message",
+	}
+	return strings.Join(lines, "\n")
 }

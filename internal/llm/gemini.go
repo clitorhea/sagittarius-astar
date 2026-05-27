@@ -38,11 +38,11 @@ func NewGeminiProvider(apiKey, model string) (*GeminiProvider, error) {
 
 // StreamChat streams a response from Gemini into tokenChan.
 // The channel is always closed before this function returns.
+// Returns all function calls requested in this turn (may be > 1).
 //
 // google.golang.org/genai v1.x returns iter.Seq2[*genai.GenerateContentResponse, error]
-// from GenerateContentStream. We consume it with the Go 1.23 range-over-func pattern,
-// which is cleaner and doesn't require the google.golang.org/api/iterator sentinel.
-func (g *GeminiProvider) StreamChat(ctx context.Context, messages []Message, tools []Tool, tokenChan chan<- string) (*ToolCall, error) {
+// from GenerateContentStream. We consume it with the Go 1.23 range-over-func pattern.
+func (g *GeminiProvider) StreamChat(ctx context.Context, messages []Message, tools []Tool, tokenChan chan<- string) ([]ToolCall, error) {
 	defer close(tokenChan)
 
 	logger.L.Debug("gemini: stream starting",
@@ -67,7 +67,6 @@ func (g *GeminiProvider) StreamChat(ctx context.Context, messages []Message, too
 		case RoleUser:
 			contents = append(contents, genai.NewContentFromText(msg.Content, genai.RoleUser))
 		case RoleAssistant:
-			// if it had a tool call, we need to map it
 			if len(msg.ToolCalls) > 0 {
 				tc := msg.ToolCalls[0]
 				contents = append(contents, genai.NewContentFromFunctionCall(tc.Name, tc.Args, genai.RoleModel))
@@ -99,8 +98,9 @@ func (g *GeminiProvider) StreamChat(ctx context.Context, messages []Message, too
 		cfg.Tools = []*genai.Tool{{FunctionDeclarations: decls}}
 	}
 
-	// GenerateContentStream returns iter.Seq2[*genai.GenerateContentResponse, error].
-	// Range-over-func is the idiomatic way to consume it in Go 1.23+.
+	// Collect all function calls across the entire streamed response.
+	var collectedCalls []ToolCall
+
 	for resp, err := range g.client.Models.GenerateContentStream(ctx, g.model, contents, cfg) {
 		if err != nil {
 			logger.L.Error("gemini: stream error", "error", err)
@@ -113,11 +113,13 @@ func (g *GeminiProvider) StreamChat(ctx context.Context, messages []Message, too
 			}
 			for _, part := range cand.Content.Parts {
 				if part.FunctionCall != nil {
-					return &ToolCall{
+					collectedCalls = append(collectedCalls, ToolCall{
 						ID:   part.FunctionCall.ID,
 						Name: part.FunctionCall.Name,
 						Args: part.FunctionCall.Args,
-					}, nil
+					})
+					// Do not stream text when tool calls are being made.
+					continue
 				}
 				if part.Text != "" {
 					tokenCount++
@@ -132,5 +134,9 @@ func (g *GeminiProvider) StreamChat(ctx context.Context, messages []Message, too
 		}
 	}
 
+	if len(collectedCalls) > 0 {
+		logger.L.Debug("gemini: tool calls received", "count", len(collectedCalls))
+		return collectedCalls, nil
+	}
 	return nil, nil
 }

@@ -7,6 +7,8 @@
 package session
 
 import (
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -52,9 +54,13 @@ func Dir() string {
 	return filepath.Join(home, ".local", "share", "aig", "sessions")
 }
 
-// GenerateID produces a unique timestamp-based session identifier.
+// GenerateID produces a unique session identifier combining a timestamp and
+// a random 4-byte hex suffix to avoid collisions when sessions are created
+// within the same second.
 func GenerateID() string {
-	return time.Now().Format("20060102-150405")
+	b := make([]byte, 4)
+	_, _ = rand.Read(b)
+	return time.Now().Format("20060102-150405") + "-" + hex.EncodeToString(b)
 }
 
 // Save writes the session to disk.

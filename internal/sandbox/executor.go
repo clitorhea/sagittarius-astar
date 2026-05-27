@@ -9,9 +9,17 @@ import (
 	"os/exec"
 	"runtime"
 	"strings"
+	"time"
 
 	"github.com/clitorhea/sagittarius-astar.git/internal/logger"
 )
+
+// DefaultTimeout is the maximum wall-clock time a sandboxed command may run.
+// Commands that exceed this are killed automatically.
+const DefaultTimeout = 30 * time.Second
+
+// MaxTimeout is the ceiling a caller may request for a single command.
+const MaxTimeout = 120 * time.Second
 
 // Result holds the combined output from an executed command.
 type Result struct {
@@ -24,6 +32,7 @@ type Result struct {
 // for injection into LLM conversation history.
 func (r Result) Combined() string {
 	var sb strings.Builder
+	fmt.Fprintf(&sb, "exit_code: %d\n", r.ExitCode)
 	if r.Stdout != "" {
 		sb.WriteString("--- stdout ---\n")
 		sb.WriteString(r.Stdout)
@@ -32,30 +41,61 @@ func (r Result) Combined() string {
 		sb.WriteString("\n--- stderr ---\n")
 		sb.WriteString(r.Stderr)
 	}
-	if r.ExitCode != 0 {
-		fmt.Fprintf(&sb, "\n--- exit code: %d ---\n", r.ExitCode)
-	}
 	return strings.TrimSpace(sb.String())
+}
+
+// Options configures a single Execute call.
+type Options struct {
+	// WorkingDir sets the command's working directory.
+	// An empty string inherits the process working directory.
+	WorkingDir string
+
+	// Timeout overrides DefaultTimeout for this call.
+	// Values ≤ 0 use DefaultTimeout; values > MaxTimeout are clamped to MaxTimeout.
+	Timeout time.Duration
 }
 
 // Execute runs the given command string using the platform-appropriate shell.
 // On Linux/macOS it uses /bin/bash -c; on Windows it uses powershell.exe -Command.
-// The context is respected for cancellation/timeout.
-func Execute(ctx context.Context, command string) (*Result, error) {
-	var cmd *exec.Cmd
+//
+// A hard timeout is applied automatically. If the parent context is already
+// shorter, that deadline wins.
+func Execute(ctx context.Context, command string, opts ...Options) (*Result, error) {
+	var opt Options
+	if len(opts) > 0 {
+		opt = opts[0]
+	}
+
+	timeout := opt.Timeout
+	switch {
+	case timeout <= 0:
+		timeout = DefaultTimeout
+	case timeout > MaxTimeout:
+		timeout = MaxTimeout
+	}
+
+	timeoutCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
 
 	shell := Shell()
 	logger.L.Info("sandbox: executing command",
 		"shell", shell,
 		"os", runtime.GOOS,
 		"command", command,
+		"working_dir", opt.WorkingDir,
+		"timeout", timeout,
 	)
 
+	var cmd *exec.Cmd
 	switch runtime.GOOS {
 	case "windows":
-		cmd = exec.CommandContext(ctx, "powershell.exe", "-NoProfile", "-NonInteractive", "-Command", command)
+		cmd = exec.CommandContext(timeoutCtx, "powershell.exe", "-NoProfile", "-NonInteractive", "-Command", command)
 	default: // linux, darwin, etc.
-		cmd = exec.CommandContext(ctx, "/bin/bash", "-c", command)
+		cmd = exec.CommandContext(timeoutCtx, "/bin/bash", "-c", command)
+	}
+
+	if opt.WorkingDir != "" {
+		cmd.Dir = opt.WorkingDir
 	}
 
 	var stdout, stderr bytes.Buffer
@@ -78,6 +118,10 @@ func Execute(ctx context.Context, command string) (*Result, error) {
 			)
 			return result, nil
 		}
+		if timeoutCtx.Err() == context.DeadlineExceeded {
+			logger.L.Error("sandbox: command timed out", "timeout", timeout)
+			return result, fmt.Errorf("executor: command timed out after %s", timeout)
+		}
 		logger.L.Error("sandbox: failed to start command", "error", err)
 		return result, fmt.Errorf("executor: failed to start command: %w", err)
 	}
@@ -90,7 +134,6 @@ func Execute(ctx context.Context, command string) (*Result, error) {
 }
 
 // Shell returns the shell binary path used on the current OS.
-// Useful for display purposes in the TUI.
 func Shell() string {
 	if runtime.GOOS == "windows" {
 		return "powershell.exe"

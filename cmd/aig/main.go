@@ -167,7 +167,14 @@ func runChat(_ *cobra.Command, _ []string) error {
 	logger.L.Debug("provider initialised", "provider", cfg.Provider, "model", cfg.Model)
 
 	// ── TUI ───────────────────────────────────────────────────────────────────
-	model, err := tui.NewModel(provider, activeSession, cfg.SystemPrompt, version)
+	// Build per-provider API key map so the TUI can switch providers/models at runtime.
+	fc := config.LoadFileConfig()
+	apiKeys := map[string]string{
+		string(config.ProviderGemini):   coalesceEnv("GEMINI_API_KEY", fc.GeminiAPIKey),
+		string(config.ProviderDeepSeek): coalesceEnv("DEEPSEEK_API_KEY", fc.DeepSeekAPIKey),
+	}
+
+	model, err := tui.NewModel(provider, activeSession, cfg.SystemPrompt, version, string(cfg.Provider), cfg.Model, apiKeys)
 	if err != nil {
 		logger.L.Error("TUI init failed", "error", err)
 		return fmt.Errorf("failed to initialize TUI: %w", err)
@@ -187,4 +194,13 @@ func runChat(_ *cobra.Command, _ []string) error {
 
 	logger.L.Info("aig exited cleanly")
 	return nil
+}
+
+// coalesceEnv returns the value of the named environment variable if set,
+// otherwise returns the fallback string (e.g. from the config file).
+func coalesceEnv(envName, fallback string) string {
+	if v := os.Getenv(envName); v != "" {
+		return v
+	}
+	return fallback
 }
