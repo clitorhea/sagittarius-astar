@@ -58,6 +58,8 @@ type selectionItem struct {
 	Label string
 }
 
+type sessionTitleMsg string
+
 // Model is the Bubble Tea application model for aig.
 type Model struct {
 	// Core state
@@ -68,6 +70,7 @@ type Model struct {
 	// Session management
 	activeSession       *session.Session
 	defaultSystemPrompt string
+	titleGenerated      bool
 
 	// Selection state
 	selectionItems []selectionItem
@@ -260,6 +263,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 						} else {
 							m.history = nil
 						}
+						m.titleGenerated = false
 						m.saveSession()
 						m.refreshViewport()
 						break
@@ -369,6 +373,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 							}}
 						}
 						m.history = m.activeSession.History
+						m.titleGenerated = false
 						m.outputLines = nil
 						m.saveSession()
 						m.appendOutput(lipgloss.NewStyle().Foreground(colorGreen).Render("Started fresh session: " + m.activeSession.ID))
@@ -460,6 +465,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 						} else {
 							m.activeSession = s
 							m.loadHistory(s.History)
+							m.titleGenerated = false
 							m.appendOutput(lipgloss.NewStyle().Foreground(colorGreen).Render("Loaded session: " + s.ID))
 						}
 						m.refreshViewport()
@@ -668,6 +674,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				} else {
 					m.history = nil
 				}
+				m.titleGenerated = false
 				m.saveSession()
 				m.refreshViewport()
 				return m, nil
@@ -903,6 +910,24 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.outputLines = append(m.outputLines, strings.TrimRight(rendered, "\n"))
 		m.outputLines = append(m.outputLines, divider(m.width))
 
+		// Generate a title for fresh sessions
+		var titleCmd tea.Cmd
+		if m.activeSession != nil && m.activeSession.Name == "Untitled" && !m.titleGenerated {
+			hasUser := false
+			hasAssistant := false
+			for _, msg := range m.history {
+				if msg.Role == llm.RoleUser {
+					hasUser = true
+				} else if msg.Role == llm.RoleAssistant {
+					hasAssistant = true
+				}
+			}
+			if hasUser && hasAssistant {
+				m.titleGenerated = true
+				titleCmd = m.generateSessionTitleCmd()
+			}
+		}
+
 		// Check for executable code blocks.
 		if match := execLangPattern.FindStringSubmatch(raw); match != nil {
 			lang := match[1]
@@ -920,11 +945,11 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.cmdTextarea.Focus()
 			
 			m.refreshViewport()
-			return m, nil
+			return m, titleCmd
 		}
 
 		m.resetToInput()
-		return m, nil
+		return m, titleCmd
 
 	// ── Stream error ───────────────────────────────────────────────────────
 	case streamErrMsg:
@@ -1026,6 +1051,14 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.pendingToolCalls = nil
 		m.pendingToolIdx = 0
 		return m, tea.Batch(m.startStreaming()...)
+
+	case sessionTitleMsg:
+		if string(msg) != "" && m.activeSession != nil {
+			m.activeSession.Name = string(msg)
+			m.saveSession()
+			m.refreshViewport()
+		}
+		return m, nil
 	}
 
 	// ── Delegate to sub-components ─────────────────────────────────────────
@@ -1200,6 +1233,7 @@ func (m Model) handleSelection(id string) (Model, tea.Cmd) {
 			}
 		}
 		m.loadHistory(s.History)
+		m.titleGenerated = false
 		m.appendOutput(lipgloss.NewStyle().Foreground(colorGreen).Render("Loaded session: " + s.ID))
 		return m, nil
 
@@ -1251,6 +1285,55 @@ func (m Model) handleSelection(id string) (Model, tea.Cmd) {
 		return m, nil
 	}
 	return m, nil
+}
+
+// generateSessionTitleCmd calls the LLM in the background to generate a summary title.
+func (m Model) generateSessionTitleCmd() tea.Cmd {
+	var userQuery string
+	for _, msg := range m.history {
+		if msg.Role == llm.RoleUser {
+			userQuery = msg.Content
+			break
+		}
+	}
+	if userQuery == "" {
+		return nil
+	}
+
+	provider := m.provider
+	return func() tea.Msg {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+
+		prompt := fmt.Sprintf("Summarize the following topic/query into a short, concise conversation title of 3-5 words. Return ONLY the title, with no quotation marks, no markdown formatting, and no extra text:\n\n%s", userQuery)
+
+		tokenChan := make(chan string, 100)
+		go func() {
+			defer close(tokenChan)
+			_, _, err := provider.StreamChat(ctx, []llm.Message{
+				{Role: llm.RoleUser, Content: prompt},
+			}, nil, tokenChan)
+			if err != nil {
+				logger.L.Error("title generation background stream failed", "error", err)
+			}
+		}()
+
+		var sb strings.Builder
+		for token := range tokenChan {
+			sb.WriteString(token)
+		}
+
+		title := strings.TrimSpace(sb.String())
+		title = strings.Trim(title, "\"`'*")
+		logger.L.Info("generated session title", "title", title)
+		if title == "" {
+			return sessionTitleMsg("")
+		}
+		if len(title) > 60 {
+			title = title[:57] + "..."
+		}
+		return sessionTitleMsg(title)
+	}
 }
 
 // ── Internal helpers ──────────────────────────────────────────────────────────

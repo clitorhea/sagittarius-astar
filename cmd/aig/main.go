@@ -159,10 +159,6 @@ func runChat(_ *cobra.Command, _ []string) error {
 				Content: cfg.SystemPrompt,
 			}}
 		}
-		// Save the session right away to allocate it
-		if err := session.Save(activeSession); err != nil {
-			logger.L.Error("failed to save new session initial state", "error", err)
-		}
 		logger.L.Info("created fresh session", "id", activeSession.ID)
 	}
 

@@ -32,6 +32,16 @@ type Session struct {
 	History   []llm.Message `json:"history"`
 }
 
+// HasContent returns true if the session contains actual user/assistant conversation content.
+func (s *Session) HasContent() bool {
+	for _, msg := range s.History {
+		if msg.Role != llm.RoleSystem {
+			return true
+		}
+	}
+	return false
+}
+
 // Dir returns the platform-appropriate directory for sessions.
 func Dir() string {
 	// Standard XDG compliance
@@ -70,13 +80,21 @@ func Save(s *Session) error {
 		return fmt.Errorf("session: cannot create directory: %w", err)
 	}
 
+	filename := filepath.Join(dir, s.ID+".json")
+	if !s.HasContent() {
+		// If the session has no actual conversation content, delete it if it exists
+		if _, err := os.Stat(filename); err == nil {
+			_ = os.Remove(filename)
+		}
+		return nil
+	}
+
 	s.UpdatedAt = time.Now()
 	data, err := json.MarshalIndent(s, "", "  ")
 	if err != nil {
 		return fmt.Errorf("session: failed to marshal: %w", err)
 	}
 
-	filename := filepath.Join(dir, s.ID+".json")
 	if err := os.WriteFile(filename, data, 0o600); err != nil {
 		return fmt.Errorf("session: failed to write file: %w", err)
 	}
@@ -137,6 +155,12 @@ func List() ([]Session, error) {
 		s, err := Load(id)
 		if err != nil {
 			// Skip corrupt session files rather than failing the whole list
+			continue
+		}
+		if !s.HasContent() {
+			// Clean up legacy empty session files from disk
+			filename := filepath.Join(dir, entry.Name())
+			_ = os.Remove(filename)
 			continue
 		}
 		sessions = append(sessions, *s)
