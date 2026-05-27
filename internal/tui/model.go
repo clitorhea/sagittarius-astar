@@ -1071,6 +1071,7 @@ func (m *Model) loadHistory(history []llm.Message) {
 			)
 		}
 	}
+	m.refreshViewport()
 }
 
 // saveSession persists the active session history to disk.
