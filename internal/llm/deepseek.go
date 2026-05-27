@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"strings"
 
 	openai "github.com/sashabaranov/go-openai"
 
@@ -35,8 +36,15 @@ func NewDeepSeekProvider(apiKey, model string) (*DeepSeekProvider, error) {
 
 // StreamChat streams a response from DeepSeek into tokenChan.
 // The channel is always closed before this function returns.
-// Returns all tool calls requested in this turn (may be > 1).
-func (d *DeepSeekProvider) StreamChat(ctx context.Context, messages []Message, tools []Tool, tokenChan chan<- string) ([]ToolCall, error) {
+//
+// Returns (toolCalls, reasoningContent, error):
+//   - toolCalls: non-nil when the model requested tool execution.
+//   - reasoningContent: chain-of-thought text emitted by DeepSeek thinking
+//     models (deepseek-v4-pro / deepseek-reasoner). Callers MUST store this in
+//     the assistant Message and echo it on the next request or the API returns
+//     HTTP 400 ("reasoning_content must be passed back").
+//   - err: any transport or API error.
+func (d *DeepSeekProvider) StreamChat(ctx context.Context, messages []Message, tools []Tool, tokenChan chan<- string) ([]ToolCall, string, error) {
 	defer close(tokenChan)
 
 	logger.L.Debug("deepseek: stream starting",
@@ -64,10 +72,13 @@ func (d *DeepSeekProvider) StreamChat(ctx context.Context, messages []Message, t
 		}
 
 		oaiMsg := openai.ChatCompletionMessage{
-			Role:       role,
-			Content:    msg.Content,
-			Name:       msg.ToolName,
-			ToolCallID: msg.ToolCallID,
+			Role:    role,
+			Content: msg.Content,
+			Name:    msg.ToolName,
+			// ReasoningContent MUST be echoed back for DeepSeek thinking models.
+			// The field has json:"...,omitempty" so it is safe for non-thinking models.
+			ReasoningContent: msg.ReasoningContent,
+			ToolCallID:       msg.ToolCallID,
 		}
 		if len(msg.ToolCalls) > 0 {
 			for _, tc := range msg.ToolCalls {
@@ -106,7 +117,7 @@ func (d *DeepSeekProvider) StreamChat(ctx context.Context, messages []Message, t
 
 	stream, err := d.client.CreateChatCompletionStream(ctx, req)
 	if err != nil {
-		return nil, fmt.Errorf("deepseek: failed to create stream: %w", err)
+		return nil, "", fmt.Errorf("deepseek: failed to create stream: %w", err)
 	}
 	defer stream.Close()
 
@@ -118,6 +129,10 @@ func (d *DeepSeekProvider) StreamChat(ctx context.Context, messages []Message, t
 		args string
 	})
 
+	// reasoningBuf accumulates chain-of-thought tokens from thinking models.
+	// These arrive in Delta.ReasoningContent before regular content tokens.
+	var reasoningBuf strings.Builder
+
 	for {
 		resp, err := stream.Recv()
 		if errors.Is(err, io.EOF) {
@@ -125,7 +140,7 @@ func (d *DeepSeekProvider) StreamChat(ctx context.Context, messages []Message, t
 		}
 		if err != nil {
 			logger.L.Error("deepseek: stream recv error", "error", err)
-			return nil, fmt.Errorf("deepseek: stream error: %w", err)
+			return nil, "", fmt.Errorf("deepseek: stream error: %w", err)
 		}
 
 		if len(resp.Choices) == 0 {
@@ -133,6 +148,11 @@ func (d *DeepSeekProvider) StreamChat(ctx context.Context, messages []Message, t
 		}
 
 		choice := resp.Choices[0]
+
+		// Collect chain-of-thought tokens (thinking models only).
+		if rc := choice.Delta.ReasoningContent; rc != "" {
+			reasoningBuf.WriteString(rc)
+		}
 
 		// Accumulate all tool call deltas by index.
 		for _, tc := range choice.Delta.ToolCalls {
@@ -177,7 +197,10 @@ func (d *DeepSeekProvider) StreamChat(ctx context.Context, messages []Message, t
 				})
 			}
 			logger.L.Debug("deepseek: tool calls received", "count", len(calls))
-			return calls, nil
+			// Return reasoning content alongside the tool calls so the caller
+			// can atomically store it in the assistant message. This avoids any
+			// race between the token channel and the toolCallBatchMsg.
+			return calls, reasoningBuf.String(), nil
 		}
 
 		delta := choice.Delta.Content
@@ -189,10 +212,12 @@ func (d *DeepSeekProvider) StreamChat(ctx context.Context, messages []Message, t
 		select {
 		case <-ctx.Done():
 			logger.L.Warn("deepseek: stream cancelled by context", "tokens_received", tokenCount)
-			return nil, ctx.Err()
+			return nil, "", ctx.Err()
 		case tokenChan <- delta:
 		}
 	}
 
-	return nil, nil
+	// Non-tool turn: return any reasoning content accumulated (e.g. when a
+	// thinking model responds without calling tools).
+	return nil, reasoningBuf.String(), nil
 }

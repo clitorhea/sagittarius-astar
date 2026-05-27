@@ -90,6 +90,7 @@ On first launch, `aig` generates a default `config.json` at:
 {
   "default_provider": "gemini",
   "default_model": "",
+  "default_persona": "coder",
   "gemini_api_key": "YOUR_GEMINI_KEY",
   "deepseek_api_key": "YOUR_DEEPSEEK_KEY",
   "personas": {
@@ -116,8 +117,11 @@ aig -p deepseek -m deepseek-v4-flash
 aig --persona sysadmin
 aig -s coder
 
-# Resume a previous conversation by ID
-aig --resume 20260521-170000
+# Resume the most recent session
+aig -r
+aig --resume
+
+# Resume a specific conversation by ID
 aig -r 20260521-170000
 ```
 

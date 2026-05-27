@@ -42,7 +42,7 @@ func NewGeminiProvider(apiKey, model string) (*GeminiProvider, error) {
 //
 // google.golang.org/genai v1.x returns iter.Seq2[*genai.GenerateContentResponse, error]
 // from GenerateContentStream. We consume it with the Go 1.23 range-over-func pattern.
-func (g *GeminiProvider) StreamChat(ctx context.Context, messages []Message, tools []Tool, tokenChan chan<- string) ([]ToolCall, error) {
+func (g *GeminiProvider) StreamChat(ctx context.Context, messages []Message, tools []Tool, tokenChan chan<- string) ([]ToolCall, string, error) {
 	defer close(tokenChan)
 
 	logger.L.Debug("gemini: stream starting",
@@ -104,7 +104,7 @@ func (g *GeminiProvider) StreamChat(ctx context.Context, messages []Message, too
 	for resp, err := range g.client.Models.GenerateContentStream(ctx, g.model, contents, cfg) {
 		if err != nil {
 			logger.L.Error("gemini: stream error", "error", err)
-			return nil, fmt.Errorf("gemini: stream error: %w", err)
+			return nil, "", fmt.Errorf("gemini: stream error: %w", err)
 		}
 
 		for _, cand := range resp.Candidates {
@@ -126,7 +126,7 @@ func (g *GeminiProvider) StreamChat(ctx context.Context, messages []Message, too
 					select {
 					case <-ctx.Done():
 						logger.L.Warn("gemini: stream cancelled by context", "tokens_received", tokenCount)
-						return nil, ctx.Err()
+						return nil, "", ctx.Err()
 					case tokenChan <- part.Text:
 					}
 				}
@@ -136,7 +136,7 @@ func (g *GeminiProvider) StreamChat(ctx context.Context, messages []Message, too
 
 	if len(collectedCalls) > 0 {
 		logger.L.Debug("gemini: tool calls received", "count", len(collectedCalls))
-		return collectedCalls, nil
+		return collectedCalls, "", nil
 	}
-	return nil, nil
+	return nil, "", nil
 }

@@ -66,6 +66,7 @@ type Model struct {
 	// Provider / model identity (for status bar)
 	activeProvider string
 	activeModel    string
+	activePersona  string
 
 	// Runtime switching — API keys per provider, personas from config
 	apiKeys    map[string]string  // provider name → API key
@@ -79,9 +80,10 @@ type Model struct {
 	pendingToolIdx   int // index of the next call to process in pendingToolCalls
 
 	// Streaming state
-	tokenChan    chan string
-	streamBuffer string // accumulates tokens during streaming
-	cancelStream context.CancelFunc
+	tokenChan       chan string
+	streamBuffer    string // accumulates tokens during streaming
+	reasoningBuffer string // accumulates DeepSeek reasoning_content tokens (not displayed)
+	cancelStream   context.CancelFunc
 
 	// Pending command execution
 	pendingCmd  string
@@ -121,7 +123,7 @@ type Model struct {
 }
 
 // NewModel constructs a new TUI model wired to the given LLM provider and session.
-func NewModel(provider llm.Provider, activeSession *session.Session, defaultSystemPrompt string, appVersion string, providerName string, modelName string, apiKeys map[string]string) (*Model, error) {
+func NewModel(provider llm.Provider, activeSession *session.Session, defaultSystemPrompt string, appVersion string, providerName string, modelName string, personaName string, apiKeys map[string]string) (*Model, error) {
 	// Text area
 	ta := textarea.New()
 	ta.Placeholder = "Ask anything… (Enter to send, Shift+Enter for newline, /help for commands)"
@@ -173,6 +175,7 @@ func NewModel(provider llm.Provider, activeSession *session.Session, defaultSyst
 		appVersion:          appVersion,
 		activeProvider:      providerName,
 		activeModel:         modelName,
+		activePersona:       personaName,
 		apiKeys:             apiKeys,
 		fileConfig:          config.LoadFileConfig(),
 	}
@@ -541,6 +544,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					}
 
 					m.defaultSystemPrompt = prompt
+					m.activePersona = arg
 					// Replace or prepend the leading system message in history
 					if len(m.history) > 0 && m.history[0].Role == llm.RoleSystem {
 						m.history[0].Content = prompt
@@ -782,11 +786,14 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		raw := m.streamBuffer
 		m.streamBuffer = ""
 
-		// Add assistant turn to history.
+		// Add assistant turn to history. ReasoningContent comes from the
+		// streamDoneMsg for non-tool turns (DeepSeek thinking models).
 		m.history = append(m.history, llm.Message{
-			Role:    llm.RoleAssistant,
-			Content: raw,
+			Role:             llm.RoleAssistant,
+			Content:          raw,
+			ReasoningContent: msg.ReasoningContent,
 		})
+		m.reasoningBuffer = ""
 		logger.L.Info("stream completed", "response_len", len(raw))
 		m.saveSession()
 
@@ -825,18 +832,19 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 
-		m.appState = stateInput
-		m.refreshViewport()
+		m.resetToInput()
 		return m, nil
 
 	// ── Stream error ───────────────────────────────────────────────────────
 	case streamErrMsg:
 		m.streamBuffer = ""
-		m.appState = stateInput
+		m.reasoningBuffer = ""
+		m.pendingToolCalls = nil
+		m.pendingToolIdx = 0
 		m.lastErr = msg.err.Error()
 		logger.L.Error("stream error received", "error", msg.err)
 		m.appendOutput(errorStyle.Render("✗ Error: " + m.lastErr))
-		m.refreshViewport()
+		m.resetToInput()
 		return m, nil
 
 	// ── Sandbox execution result ───────────────────────────────────────────
@@ -862,8 +870,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		m.pendingCmd = ""
 		m.pendingLang = ""
-		m.appState = stateInput
-		m.refreshViewport()
+		m.resetToInput()
 		return m, nil
 
 	// ── Tool batch received from LLM ───────────────────────────────────────
@@ -875,18 +882,20 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 		calls := msg.Calls
 		if len(calls) == 0 {
-			m.appState = stateInput
-			m.refreshViewport()
+			m.resetToInput()
 			return m, nil
 		}
 
 		// Record the full assistant turn (all tool calls in one message).
+		// ReasoningContent comes atomically from the toolCallBatchMsg itself.
 		assistantTCs := make([]llm.ToolCall, len(calls))
 		copy(assistantTCs, calls)
 		m.history = append(m.history, llm.Message{
-			Role:      llm.RoleAssistant,
-			ToolCalls: assistantTCs,
+			Role:             llm.RoleAssistant,
+			ToolCalls:        assistantTCs,
+			ReasoningContent: msg.ReasoningContent,
 		})
+		m.reasoningBuffer = ""
 
 		// Store the batch and start processing from index 0.
 		m.pendingToolCalls = calls
@@ -1124,14 +1133,14 @@ func (m *Model) startStreaming() []tea.Cmd {
 	streamCmd := func() tea.Msg {
 		// Prune to a default context limit (100k tokens approx ~400k chars)
 		prunedHistory := llm.PruneHistory(m.history, 100000)
-		toolCalls, err := m.provider.StreamChat(ctx, prunedHistory, AgentTools(), ch)
+		toolCalls, reasoningContent, err := m.provider.StreamChat(ctx, prunedHistory, AgentTools(), ch)
 		if err != nil {
 			return streamErrMsg{err: err}
 		}
 		if len(toolCalls) > 0 {
-			return toolCallBatchMsg{Calls: toolCalls}
+			return toolCallBatchMsg{Calls: toolCalls, ReasoningContent: reasoningContent}
 		}
-		return streamDoneMsg{}
+		return streamDoneMsg{ReasoningContent: reasoningContent}
 	}
 
 	return []tea.Cmd{
@@ -1153,6 +1162,22 @@ func waitForToken(ch chan string) tea.Cmd {
 		}
 		return tokenMsg(token)
 	}
+}
+
+// resetToInput transitions the TUI back to the interactive input state.
+// It must be called from every path that returns to stateInput to ensure
+// the main textarea is re-focused and any in-flight streams are cancelled.
+func (m *Model) resetToInput() {
+	// Cancel any in-flight LLM stream context so the goroutine exits cleanly.
+	if m.cancelStream != nil {
+		m.cancelStream()
+		m.cancelStream = nil
+	}
+	m.appState = stateInput
+	// Re-focus the main input area so the user can type immediately.
+	m.cmdTextarea.Blur()
+	m.textarea.Focus()
+	m.refreshViewport()
 }
 
 // runSandboxCmd executes the pending command in the sandbox.
@@ -1346,6 +1371,12 @@ func (m Model) statusBar() string {
 		modelInfo = fmt.Sprintf("%s/%s", m.activeProvider, m.activeModel)
 	}
 
+	// Persona info
+	personaInfo := ""
+	if m.activePersona != "" {
+		personaInfo = fmt.Sprintf("🎨 %s", m.activePersona)
+	}
+
 	// Auto-approve badge
 	autoTag := ""
 	if m.autoApproveCommands {
@@ -1358,13 +1389,16 @@ func (m Model) statusBar() string {
 		leftText = fmt.Sprintf("%s · %s", statusText, sessionInfo)
 	}
 
-	// Right side: tokens · model · auto badge · help hint
+	// Right side: tokens · model · persona · auto badge · help hint
 	rightParts := []string{}
 	if tokenInfo != "" {
 		rightParts = append(rightParts, lipgloss.NewStyle().Foreground(colorSubtext).Render(tokenInfo))
 	}
 	if modelInfo != "" {
 		rightParts = append(rightParts, lipgloss.NewStyle().Foreground(colorOverlay).Render(modelInfo))
+	}
+	if personaInfo != "" {
+		rightParts = append(rightParts, lipgloss.NewStyle().Foreground(colorAccent).Render(personaInfo))
 	}
 	if autoTag != "" {
 		rightParts = append(rightParts, autoTag)

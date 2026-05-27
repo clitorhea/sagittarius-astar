@@ -38,6 +38,7 @@ type Config struct {
 	Provider     ProviderName
 	Model        string
 	APIKey       string
+	Persona      string
 	SystemPrompt string
 }
 
@@ -45,6 +46,7 @@ type Config struct {
 type FileConfig struct {
 	DefaultProvider string            `json:"default_provider"`
 	DefaultModel    string            `json:"default_model"`
+	DefaultPersona  string            `json:"default_persona,omitempty"`
 	GeminiAPIKey    string            `json:"gemini_api_key,omitempty"`
 	DeepSeekAPIKey  string            `json:"deepseek_api_key,omitempty"`
 	Personas        map[string]string `json:"personas,omitempty"`
@@ -148,6 +150,7 @@ func WriteDefaultConfig(path string) error {
 	fc := FileConfig{
 		DefaultProvider: "gemini",
 		DefaultModel:    "",
+		DefaultPersona:  "coder",
 		GeminiAPIKey:    "",
 		DeepSeekAPIKey:  "",
 		Personas:        defaultPersonas,
@@ -227,11 +230,14 @@ func Load(providerOverride ProviderName, modelOverride string, personaName strin
 
 	// 4. Resolve System Prompt (Persona)
 	if personaName == "" {
-		personaName = "default"
+		personaName = fc.DefaultPersona
+	}
+	if personaName == "" {
+		personaName = "coder"
 	}
 	personaName = strings.ToLower(personaName)
 
-	systemPrompt := defaultPersonas["default"]
+	systemPrompt := defaultPersonas["coder"]
 	if fc.Personas != nil {
 		if prompt, ok := fc.Personas[personaName]; ok {
 			systemPrompt = prompt
@@ -250,6 +256,7 @@ func Load(providerOverride ProviderName, modelOverride string, personaName strin
 		Provider:     provider,
 		Model:        model,
 		APIKey:       apiKey,
+		Persona:      personaName,
 		SystemPrompt: systemPrompt,
 	}, nil
 }

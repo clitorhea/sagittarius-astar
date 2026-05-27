@@ -7,7 +7,10 @@ import "github.com/clitorhea/sagittarius-astar.git/internal/llm"
 type tokenMsg string
 
 // streamDoneMsg signals that the LLM stream has completed successfully.
-type streamDoneMsg struct{}
+// ReasoningContent is non-empty for DeepSeek thinking models on non-tool turns.
+type streamDoneMsg struct {
+	ReasoningContent string
+}
 
 // streamErrMsg signals that the LLM stream encountered an error.
 type streamErrMsg struct{ err error }
@@ -36,7 +39,8 @@ type toolCallMsg struct {
 // toolCallBatchMsg signals that the LLM requested one or more tool calls
 // in a single turn. This is the primary dispatch path.
 type toolCallBatchMsg struct {
-	Calls []llm.ToolCall
+	Calls            []llm.ToolCall
+	ReasoningContent string // populated by DeepSeek thinking models
 }
 
 // windowSizeMsg is re-exported here for clarity (bubbletea sends tea.WindowSizeMsg natively).

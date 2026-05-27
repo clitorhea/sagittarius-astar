@@ -104,6 +104,18 @@ func Load(id string) (*Session, error) {
 	return &s, nil
 }
 
+// LoadLatest returns the most recently updated session, or an error if none exist.
+func LoadLatest() (*Session, error) {
+	sessions, err := List()
+	if err != nil {
+		return nil, err
+	}
+	if len(sessions) == 0 {
+		return nil, fmt.Errorf("no saved sessions found")
+	}
+	return &sessions[0], nil
+}
+
 // List returns all saved sessions, sorted from newest to oldest (by UpdatedAt).
 func List() ([]Session, error) {
 	dir := Dir()

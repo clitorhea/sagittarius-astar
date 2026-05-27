@@ -74,13 +74,14 @@ func init() {
 		"Model name (defaults to provider's recommended model)",
 	)
 	rootCmd.PersistentFlags().StringVarP(
-		&flagPersona, "persona", "s", "default",
-		"System prompt persona to use (default | sysadmin | coder | custom)",
+		&flagPersona, "persona", "s", "",
+		"System prompt persona to use (defaults to coder, or default_persona from config)",
 	)
 	rootCmd.PersistentFlags().StringVarP(
 		&flagResume, "resume", "r", "",
-		"Resume a previous conversation by session ID",
+		"Resume a previous conversation by session ID (defaults to 'latest' if flag is present but no ID is provided)",
 	)
+	rootCmd.PersistentFlags().Lookup("resume").NoOptDefVal = "latest"
 	rootCmd.PersistentFlags().StringVar(
 		&flagLogLevel, "log-level", "info",
 		"Log verbosity written to file (debug | info | warn | error)",
@@ -112,22 +113,37 @@ func runChat(_ *cobra.Command, _ []string) error {
 		return fmt.Errorf("configuration error: %w\n\nRun 'aig --help' for usage", err)
 	}
 
-	logger.L.Info("aig starting",
-		"provider", cfg.Provider,
-		"model", cfg.Model,
-		"persona", flagPersona,
-		"log_file", logger.LogPath,
-	)
-
 	// ── Session Resolution ───────────────────────────────────────────────────
 	var activeSession *session.Session
 	if flagResume != "" {
-		activeSession, err = session.Load(flagResume)
-		if err != nil {
-			logger.L.Error("failed to load session to resume", "id", flagResume, "error", err)
-			return fmt.Errorf("failed to resume session %q: %w", flagResume, err)
+		if flagResume == "latest" {
+			activeSession, err = session.LoadLatest()
+			if err != nil {
+				logger.L.Error("failed to load latest session", "error", err)
+				return fmt.Errorf("failed to resume latest session: %w", err)
+			}
+		} else {
+			activeSession, err = session.Load(flagResume)
+			if err != nil {
+				logger.L.Error("failed to load session to resume", "id", flagResume, "error", err)
+				return fmt.Errorf("failed to resume session %q: %w", flagResume, err)
+			}
 		}
 		logger.L.Info("resuming session", "id", activeSession.ID, "turns", len(activeSession.History))
+
+		// Override provider and model from session if not explicitly requested on CLI
+		if flagProvider == "" && activeSession.Provider != "" {
+			flagProvider = activeSession.Provider
+		}
+		if flagModel == "" && activeSession.Model != "" {
+			flagModel = activeSession.Model
+		}
+		// Re-load configuration with the updated provider/model
+		cfg, err = config.Load(config.ProviderName(flagProvider), flagModel, flagPersona)
+		if err != nil {
+			logger.L.Error("config reload failed for resumed session", "error", err)
+			return fmt.Errorf("configuration error: %w", err)
+		}
 	} else {
 		activeSession = &session.Session{
 			ID:        session.GenerateID(),
@@ -149,6 +165,13 @@ func runChat(_ *cobra.Command, _ []string) error {
 		}
 		logger.L.Info("created fresh session", "id", activeSession.ID)
 	}
+
+	logger.L.Info("aig starting",
+		"provider", cfg.Provider,
+		"model", cfg.Model,
+		"persona", cfg.Persona,
+		"log_file", logger.LogPath,
+	)
 
 	// ── Provider ──────────────────────────────────────────────────────────────
 	var provider llm.Provider
@@ -174,7 +197,7 @@ func runChat(_ *cobra.Command, _ []string) error {
 		string(config.ProviderDeepSeek): coalesceEnv("DEEPSEEK_API_KEY", fc.DeepSeekAPIKey),
 	}
 
-	model, err := tui.NewModel(provider, activeSession, cfg.SystemPrompt, version, string(cfg.Provider), cfg.Model, apiKeys)
+	model, err := tui.NewModel(provider, activeSession, cfg.SystemPrompt, version, string(cfg.Provider), cfg.Model, cfg.Persona, apiKeys)
 	if err != nil {
 		logger.L.Error("TUI init failed", "error", err)
 		return fmt.Errorf("failed to initialize TUI: %w", err)
@@ -183,7 +206,6 @@ func runChat(_ *cobra.Command, _ []string) error {
 	p := tea.NewProgram(
 		model,
 		tea.WithAltScreen(),
-		tea.WithMouseCellMotion(),
 	)
 
 	logger.L.Debug("entering TUI event loop")
