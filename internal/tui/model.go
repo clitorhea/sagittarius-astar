@@ -21,6 +21,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/charmbracelet/bubbles/progress"
 	"github.com/charmbracelet/bubbles/spinner"
 	"github.com/charmbracelet/bubbles/textarea"
 	"github.com/charmbracelet/bubbles/viewport"
@@ -115,6 +116,9 @@ type Model struct {
 	cmdTextarea textarea.Model
 	viewport    viewport.Model
 	spinner     spinner.Model
+	progressBar progress.Model
+	execStart   time.Time
+	execTimeout time.Duration
 
 	// Layout
 	width  int
@@ -162,6 +166,10 @@ func NewModel(provider llm.Provider, activeSession *session.Session, defaultSyst
 	sp.Spinner = spinner.Dot
 	sp.Style = spinnerStyle
 
+	// Progress Bar
+	pg := progress.New(progress.WithDefaultGradient())
+	pg.Width = 40
+
 	// Glamour renderer
 	renderer, err := glamour.NewTermRenderer(
 		glamour.WithStandardStyle("dark"),
@@ -183,6 +191,7 @@ func NewModel(provider llm.Provider, activeSession *session.Session, defaultSyst
 		cmdTextarea:         cta,
 		viewport:            vp,
 		spinner:             sp,
+		progressBar:         pg,
 		renderer:            renderer,
 		activeSession:       activeSession,
 		defaultSystemPrompt: defaultSystemPrompt,
@@ -228,7 +237,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	// ── Spinner tick ───────────────────────────────────────────────────────
 	case spinner.TickMsg:
-		if m.appState == stateStreaming || m.appState == stateExecuting || m.appState == stateExecutingTool {
+		if m.appState == stateStreaming || m.appState == stateExecuting || m.appState == stateExecutingTool || m.appState == stateExecutingTools {
 			var spCmd tea.Cmd
 			m.spinner, spCmd = m.spinner.Update(msg)
 			return m, spCmd
@@ -743,6 +752,11 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					call := m.pendingToolCalls[m.pendingToolIdx]
 					logger.L.Info("run_command tool: user approved", "command", cmd)
 					m.appState = stateExecutingTool
+					m.execStart = time.Now()
+					m.execTimeout = sandbox.DefaultTimeout
+					if v, ok := call.Args["timeout_seconds"].(float64); ok && v > 0 {
+						m.execTimeout = time.Duration(v) * time.Second
+					}
 					m.cmdTextarea.Blur()
 					m.appendOutput(confirmStyle.Render("⚡ Executing…"))
 					m.refreshViewport()
@@ -751,26 +765,27 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					callCopy.Args["command"] = cmd
 					ctx, cancel := context.WithCancel(context.Background())
 					m.cancelExec = cancel
-					return m, func() tea.Msg {
+					return m, tea.Batch(func() tea.Msg {
 						out, err := ExecuteRunCommand(ctx, callCopy)
 						cancel()
 						if err != nil {
 							return toolCallResultMsg{CallID: callCopy.ID, Name: callCopy.Name, Error: err}
 						}
 						return toolCallResultMsg{CallID: callCopy.ID, Name: callCopy.Name, Result: out}
-					}
+					}, m.spinner.Tick)
 				}
 				// Code-fence sandbox path.
 				logger.L.Info("sandbox: user approved execution",
-					"lang", m.pendingLang,
 					"command", cmd,
 				)
 				m.pendingCmd = cmd
 				m.appState = stateExecuting
+				m.execStart = time.Now()
+				m.execTimeout = sandbox.DefaultTimeout
 				m.cmdTextarea.Blur()
 				m.appendOutput(confirmStyle.Render("⚡ Executing…"))
 				m.refreshViewport()
-				return m, m.runSandboxCmd()
+				return m, tea.Batch(m.runSandboxCmd(), m.spinner.Tick)
 			case tea.KeyCtrlC:
 				return m, tea.Quit
 			}
@@ -813,16 +828,18 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.pendingWrite = nil
 				m.pendingWriteCallID = ""
 				m.appState = stateExecutingTool
+				m.execStart = time.Now()
+				m.execTimeout = 5 * time.Second
 				m.cmdTextarea.Blur()
 				m.textarea.Focus()
 				m.appendOutput(confirmStyle.Render("✍  Writing file…"))
 				m.refreshViewport()
-				return m, func() tea.Msg {
+				return m, tea.Batch(func() tea.Msg {
 					if err := CommitWrite(*pw); err != nil {
 						return toolCallResultMsg{CallID: callID, Name: "write_file", Error: err}
 					}
 					return toolCallResultMsg{CallID: callID, Name: "write_file", Result: fmt.Sprintf("Successfully wrote %s", pw.Path)}
-				}
+				}, m.spinner.Tick)
 			case tea.KeyEsc:
 				m.pendingWrite = nil
 				m.pendingWriteCallID = ""
@@ -1162,12 +1179,52 @@ func (m Model) View() string {
 			),
 		))
 	case stateExecuting:
+		elapsed := time.Since(m.execStart)
+		pct := 0.0
+		if m.execTimeout > 0 {
+			pct = float64(elapsed) / float64(m.execTimeout)
+		}
+		if pct > 1.0 {
+			pct = 1.0
+		}
+		bar := m.progressBar.ViewAs(pct)
+		durationInfo := fmt.Sprintf(" (%.1fs / %.1fs)", elapsed.Seconds(), m.execTimeout.Seconds())
+		cmdMsg := "running command…"
+		if m.pendingCmd != "" {
+			trimmedCmd := m.pendingCmd
+			if len(trimmedCmd) > 50 {
+				trimmedCmd = trimmedCmd[:47] + "..."
+			}
+			cmdMsg = fmt.Sprintf("running command: %s (Ctrl+C to kill)", trimmedCmd)
+		} else {
+			cmdMsg = "running command… (Ctrl+C to kill)"
+		}
 		b.WriteString(inputStyle.Render(
-			m.spinner.View() + " " + lipgloss.NewStyle().Foreground(colorSubtext).Render("running command… (Ctrl+C to kill)"),
+			lipgloss.JoinVertical(lipgloss.Left,
+				m.spinner.View()+" "+lipgloss.NewStyle().Foreground(colorSubtext).Render(cmdMsg),
+				bar+durationInfo,
+			),
 		))
 	case stateExecutingTool:
+		elapsed := time.Since(m.execStart)
+		pct := 0.0
+		if m.execTimeout > 0 {
+			pct = float64(elapsed) / float64(m.execTimeout)
+		}
+		if pct > 1.0 {
+			pct = 1.0
+		}
+		bar := m.progressBar.ViewAs(pct)
+		durationInfo := fmt.Sprintf(" (%.1fs / %.1fs)", elapsed.Seconds(), m.execTimeout.Seconds())
+		toolMsg := "executing tool…"
+		if len(m.pendingToolCalls) > 0 && m.pendingToolIdx < len(m.pendingToolCalls) {
+			toolMsg = fmt.Sprintf("executing tool: %s…", m.pendingToolCalls[m.pendingToolIdx].Name)
+		}
 		b.WriteString(inputStyle.Render(
-			m.spinner.View() + " " + lipgloss.NewStyle().Foreground(colorSubtext).Render("executing tool…"),
+			lipgloss.JoinVertical(lipgloss.Left,
+				m.spinner.View()+" "+lipgloss.NewStyle().Foreground(colorSubtext).Render(toolMsg),
+				bar+durationInfo,
+			),
 		))
 	case stateExecutingTools:
 		remaining := len(m.pendingToolCalls) - m.pendingToolIdx
@@ -1547,20 +1604,25 @@ func (m *Model) processNextToolCall() tea.Cmd {
 		if m.autoApproveCommands {
 			// Execute immediately without asking.
 			m.appState = stateExecutingTool
+			m.execStart = time.Now()
+			m.execTimeout = sandbox.DefaultTimeout
+			if v, ok := call.Args["timeout_seconds"].(float64); ok && v > 0 {
+				m.execTimeout = time.Duration(v) * time.Second
+			}
 			m.appendOutput(lipgloss.NewStyle().Foreground(colorYellow).Render(
 				fmt.Sprintf("⚡ run_command (auto): %s", command)))
 			m.refreshViewport()
 			callCopy := call
 			ctx, cancel := context.WithCancel(context.Background())
 			m.cancelExec = cancel
-			return func() tea.Msg {
+			return tea.Batch(func() tea.Msg {
 				out, err := ExecuteRunCommand(ctx, callCopy)
 				cancel()
 				if err != nil {
 					return toolCallResultMsg{CallID: callCopy.ID, Name: callCopy.Name, Error: err}
 				}
 				return toolCallResultMsg{CallID: callCopy.ID, Name: callCopy.Name, Result: out}
-			}
+			}, m.spinner.Tick)
 		}
 
 		// Prompt the user — reuse stateConfirmingCmd.
@@ -1623,17 +1685,19 @@ func (m *Model) processNextToolCall() tea.Cmd {
 	default:
 		// Safe read-only or web tools: execute immediately.
 		m.appState = stateExecutingTool
+		m.execStart = time.Now()
+		m.execTimeout = 5 * time.Second
 		m.appendOutput(lipgloss.NewStyle().Foreground(colorYellow).Render(
 			fmt.Sprintf("⚙ Tool: %s", call.Name)))
 		m.refreshViewport()
 		callCopy := call
-		return func() tea.Msg {
+		return tea.Batch(func() tea.Msg {
 			resultStr, _, err := ExecuteToolWithWrite(callCopy)
 			if err != nil {
 				return toolCallResultMsg{CallID: callCopy.ID, Name: callCopy.Name, Error: err}
 			}
 			return toolCallResultMsg{CallID: callCopy.ID, Name: callCopy.Name, Result: resultStr}
-		}
+		}, m.spinner.Tick)
 	}
 }
 
