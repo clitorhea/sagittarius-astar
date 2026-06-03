@@ -121,8 +121,9 @@ type Model struct {
 	execTimeout time.Duration
 
 	// Layout
-	width  int
-	height int
+	width             int
+	height            int
+	lastRendererWidth int
 
 	// Rendered display content
 	outputLines []string // rendered lines in the viewport
@@ -223,16 +224,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tea.WindowSizeMsg:
 		m.width = msg.Width
 		m.height = msg.Height
-		m.viewport.Width = msg.Width
-		m.viewport.Height = msg.Height - 8 // account for header, input area, margins
-		m.textarea.SetWidth(msg.Width - 4) // account for border padding
-		m.cmdTextarea.SetWidth(msg.Width - 4)
-		if m.renderer != nil {
-			m.renderer, _ = glamour.NewTermRenderer(
-				glamour.WithStandardStyle("dark"),
-				glamour.WithWordWrap(m.viewport.Width-4),
-			)
-		}
+		m.recalculateDimensions()
 		m.loadHistory(m.history)
 
 	// ── Spinner tick ───────────────────────────────────────────────────────
@@ -718,6 +710,32 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 
 		case stateConfirmingCmd:
+			// Check for viewport scroll keys first to allow reading long outputs.
+			if msg.Type == tea.KeyPgUp {
+				m.viewport.LineUp(m.viewport.Height)
+				return m, nil
+			}
+			if msg.Type == tea.KeyCtrlU {
+				m.viewport.LineUp(m.viewport.Height / 2)
+				return m, nil
+			}
+			if msg.Type == tea.KeyPgDown {
+				m.viewport.LineDown(m.viewport.Height)
+				return m, nil
+			}
+			if msg.Type == tea.KeyCtrlD {
+				m.viewport.LineDown(m.viewport.Height / 2)
+				return m, nil
+			}
+			if msg.String() == "alt+up" {
+				m.viewport.LineUp(1)
+				return m, nil
+			}
+			if msg.String() == "alt+down" {
+				m.viewport.LineDown(1)
+				return m, nil
+			}
+
 			switch msg.Type {
 			case tea.KeyEsc:
 				logger.L.Info("sandbox: user declined execution", "lang", m.pendingLang)
@@ -809,6 +827,32 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 
 		case stateConfirmingWrite:
+			// Check for viewport scroll keys first to allow reading long outputs.
+			if msg.Type == tea.KeyPgUp {
+				m.viewport.LineUp(m.viewport.Height)
+				return m, nil
+			}
+			if msg.Type == tea.KeyCtrlU {
+				m.viewport.LineUp(m.viewport.Height / 2)
+				return m, nil
+			}
+			if msg.Type == tea.KeyPgDown {
+				m.viewport.LineDown(m.viewport.Height)
+				return m, nil
+			}
+			if msg.Type == tea.KeyCtrlD {
+				m.viewport.LineDown(m.viewport.Height / 2)
+				return m, nil
+			}
+			if msg.String() == "alt+up" {
+				m.viewport.LineUp(1)
+				return m, nil
+			}
+			if msg.String() == "alt+down" {
+				m.viewport.LineDown(1)
+				return m, nil
+			}
+
 			switch msg.Type {
 			case tea.KeyEnter:
 				// 'y' + Enter or just Enter when 'y' is pre-filled confirms the write.
@@ -1121,6 +1165,8 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.spinner, spCmd = m.spinner.Update(msg)
 		cmds = append(cmds, spCmd)
 	}
+
+	m.recalculateDimensions()
 
 	return m, tea.Batch(cmds...)
 }
@@ -1449,19 +1495,199 @@ func (m *Model) loadHistory(history []llm.Message) {
 				divider(m.width),
 			)
 		} else if msg.Role == llm.RoleAssistant {
-			rendered, err := m.renderer.Render(msg.Content)
-			if err != nil {
-				rendered = msg.Content
+			if msg.Content != "" {
+				rendered, err := m.renderer.Render(msg.Content)
+				if err != nil {
+					rendered = msg.Content
+				}
+				label := assistantLabelStyle.Render("aig")
+				m.outputLines = append(m.outputLines,
+					label,
+					strings.TrimRight(rendered, "\n"),
+					divider(m.width),
+				)
 			}
-			label := assistantLabelStyle.Render("aig")
-			m.outputLines = append(m.outputLines,
-				label,
-				strings.TrimRight(rendered, "\n"),
-				divider(m.width),
-			)
+			// If there are tool calls in this assistant turn, render the completed ones.
+			for _, call := range msg.ToolCalls {
+				// Look ahead in history to see if there is a corresponding tool result.
+				hasResult := false
+				for _, searchMsg := range history {
+					if searchMsg.Role == llm.RoleTool && searchMsg.ToolCallID == call.ID {
+						hasResult = true
+						break
+					}
+				}
+				if hasResult {
+					// Render the tool call start line.
+					if call.Name == "run_command" {
+						command, _ := call.Args["command"].(string)
+						m.outputLines = append(m.outputLines, lipgloss.NewStyle().Foreground(colorYellow).Render(
+							fmt.Sprintf("⚙ Tool: run_command: %s", command)))
+					} else if call.Name == "write_file" || call.Name == "edit_file" {
+						path, _ := call.Args["path"].(string)
+						icon := "💾"
+						if call.Name == "edit_file" {
+							icon = "✏️ "
+						}
+						m.outputLines = append(m.outputLines, lipgloss.NewStyle().Foreground(colorYellow).Bold(true).Render(
+							fmt.Sprintf("%s %s: %s", icon, call.Name, path)))
+					} else {
+						m.outputLines = append(m.outputLines, lipgloss.NewStyle().Foreground(colorYellow).Render(
+							fmt.Sprintf("⚙ Tool: %s", call.Name)))
+					}
+				}
+			}
+		} else if msg.Role == llm.RoleTool {
+			if strings.HasPrefix(msg.Content, "Error:") {
+				m.outputLines = append(m.outputLines, errorStyle.Render(fmt.Sprintf("✗ Tool %s failed", msg.ToolName)))
+			} else {
+				m.outputLines = append(m.outputLines, lipgloss.NewStyle().Foreground(colorGreen).Render(fmt.Sprintf("✓ Tool %s done", msg.ToolName)))
+			}
+			// Add divider if next is a user message
+			nextIsUser := false
+			if i+1 < len(m.history) && m.history[i+1].Role == llm.RoleUser {
+				nextIsUser = true
+			}
+			if nextIsUser {
+				m.outputLines = append(m.outputLines, divider(m.width))
+			}
 		}
 	}
-	m.refreshViewport()
+
+	// Restore active/in-flight states which are not yet in m.history
+	switch m.appState {
+	case stateStreaming:
+		if m.streamBuffer == "" {
+			m.outputLines = append(m.outputLines, assistantLabelStyle.Render("aig")+" "+spinnerStyle.Render("…"))
+			m.refreshViewport()
+		} else {
+			m.refreshViewportStreaming()
+		}
+		return
+
+	case stateConfirmingCmd:
+		if m.pendingLang != "" {
+			block := codeBlockStyle.Render("```" + m.pendingLang + "\n" + m.pendingCmd + "\n```")
+			m.outputLines = append(m.outputLines, block)
+		} else {
+			m.outputLines = append(m.outputLines, confirmStyle.Render(fmt.Sprintf("🔧 run_command: %s", m.pendingCmd)))
+			m.outputLines = append(m.outputLines, lipgloss.NewStyle().Foreground(colorSubtext).Render(
+				"Enter to execute · Esc to cancel · edit command if needed"))
+		}
+
+	case stateConfirmingWrite:
+		if m.pendingWrite != nil {
+			icon := "💾"
+			toolName := "write_file"
+			if len(m.pendingToolCalls) > 0 && m.pendingToolIdx < len(m.pendingToolCalls) {
+				toolName = m.pendingToolCalls[m.pendingToolIdx].Name
+				if toolName == "edit_file" {
+					icon = "✏️ "
+				}
+			}
+			m.outputLines = append(m.outputLines, lipgloss.NewStyle().Foreground(colorYellow).Bold(true).Render(
+				fmt.Sprintf("%s %s: %s", icon, toolName, m.pendingWrite.Path)))
+
+			if m.pendingWrite.Diff != "" && m.pendingWrite.Diff != "(no changes)" {
+				m.outputLines = append(m.outputLines, lipgloss.NewStyle().Foreground(colorSubtext).Render("Diff preview:"))
+				m.outputLines = append(m.outputLines, codeBlockStyle.Render(m.pendingWrite.Diff))
+			} else {
+				preview := m.pendingWrite.Content
+				if len(preview) > 400 {
+					preview = preview[:400] + "\n...(truncated)"
+				}
+				m.outputLines = append(m.outputLines, lipgloss.NewStyle().Foreground(colorSubtext).Render(
+					fmt.Sprintf("Content preview (%d bytes):", len(m.pendingWrite.Content))))
+				m.outputLines = append(m.outputLines, codeBlockStyle.Render(preview))
+			}
+		}
+
+	case stateExecuting:
+		if m.pendingLang != "" {
+			block := codeBlockStyle.Render("```" + m.pendingLang + "\n" + m.pendingCmd + "\n```")
+			m.outputLines = append(m.outputLines, block)
+		} else {
+			m.outputLines = append(m.outputLines, confirmStyle.Render(fmt.Sprintf("🔧 run_command: %s", m.pendingCmd)))
+		}
+
+	case stateExecutingTool, stateExecutingTools:
+		if len(m.pendingToolCalls) > 0 && m.pendingToolIdx < len(m.pendingToolCalls) {
+			call := m.pendingToolCalls[m.pendingToolIdx]
+			if call.Name == "run_command" {
+				command, _ := call.Args["command"].(string)
+				if m.autoApproveCommands {
+					m.outputLines = append(m.outputLines, lipgloss.NewStyle().Foreground(colorYellow).Render(
+						fmt.Sprintf("⚡ run_command (auto): %s", command)))
+				} else {
+					m.outputLines = append(m.outputLines, confirmStyle.Render(
+						fmt.Sprintf("🔧 run_command: %s", command)))
+				}
+			} else if call.Name == "write_file" || call.Name == "edit_file" {
+				path, _ := call.Args["path"].(string)
+				icon := "💾"
+				if call.Name == "edit_file" {
+					icon = "✏️ "
+				}
+				m.outputLines = append(m.outputLines, lipgloss.NewStyle().Foreground(colorYellow).Bold(true).Render(
+					fmt.Sprintf("%s %s: %s", icon, call.Name, path)))
+			} else {
+				m.outputLines = append(m.outputLines, lipgloss.NewStyle().Foreground(colorYellow).Render(
+					fmt.Sprintf("⚙ Tool: %s", call.Name)))
+			}
+		}
+	}
+
+	m.refreshViewport()}
+
+// recalculateDimensions calculates dynamic layout heights and widths to prevent overflow or underflow.
+func (m *Model) recalculateDimensions() {
+	if m.width == 0 || m.height == 0 {
+		return
+	}
+	m.viewport.Width = m.width
+	m.textarea.SetWidth(m.width - 4)
+	m.cmdTextarea.SetWidth(m.width - 4)
+
+	overhead := 7
+
+	inputHeight := 0
+	switch m.appState {
+	case stateInput:
+		inputHeight = 5
+	case stateStreaming:
+		inputHeight = 3
+	case stateConfirmingCmd:
+		inputHeight = 8
+	case stateConfirmingWrite:
+		inputHeight = 8
+	case stateExecuting:
+		inputHeight = 4
+	case stateExecutingTool:
+		inputHeight = 4
+	case stateExecutingTools:
+		inputHeight = 3
+	case stateSelecting:
+		itemsCount := len(m.selectionItems)
+		if itemsCount > 4 {
+			itemsCount = 4
+		}
+		inputHeight = itemsCount + 3
+	default:
+		inputHeight = 5
+	}
+
+	m.viewport.Height = m.height - (overhead + inputHeight)
+	if m.viewport.Height < 5 {
+		m.viewport.Height = 5
+	}
+
+	if m.renderer != nil && m.width != m.lastRendererWidth {
+		m.renderer, _ = glamour.NewTermRenderer(
+			glamour.WithStandardStyle("dark"),
+			glamour.WithWordWrap(m.viewport.Width - 4),
+		)
+		m.lastRendererWidth = m.width
+	}
 }
 
 // saveSession persists the active session history to disk.
