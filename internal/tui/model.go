@@ -121,8 +121,10 @@ type Model struct {
 	spinner       spinner.Model
 	progressBar   progress.Model
 	execStart     time.Time
-	execTimeout   time.Duration
-	sudoPassword  string
+	execTimeout        time.Duration
+	sudoPassword       string
+	autocompletePrefix string
+	autocompleteIdx    int
 
 	// Layout
 	width             int
@@ -250,7 +252,51 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tea.KeyMsg:
 		switch m.appState {
 		case stateInput:
+			if msg.Type != tea.KeyTab {
+				m.autocompletePrefix = ""
+			}
 			switch msg.Type {
+			case tea.KeyTab:
+				currentText := m.textarea.Value()
+				if strings.HasPrefix(currentText, "/") {
+					var slashCommands = []string{
+						"/approve-tools",
+						"/clear",
+						"/delete",
+						"/exit",
+						"/help",
+						"/history",
+						"/load",
+						"/map",
+						"/model",
+						"/new",
+						"/persona",
+						"/provider",
+						"/quit",
+					}
+
+					// Start fresh or filter based on typed prefix
+					if m.autocompletePrefix == "" || !strings.HasPrefix(currentText, m.autocompletePrefix) {
+						m.autocompletePrefix = currentText
+						m.autocompleteIdx = 0
+					} else {
+						m.autocompleteIdx++
+					}
+
+					var matches []string
+					for _, cmd := range slashCommands {
+						if strings.HasPrefix(cmd, m.autocompletePrefix) {
+							matches = append(matches, cmd)
+						}
+					}
+
+					if len(matches) > 0 {
+						idx := m.autocompleteIdx % len(matches)
+						m.textarea.SetValue(matches[idx] + " ")
+						m.textarea.CursorEnd()
+					}
+					return m, nil
+				}
 			case tea.KeyEnter:
 				input := strings.TrimSpace(m.textarea.Value())
 				if input == "" {
