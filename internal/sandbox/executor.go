@@ -7,6 +7,7 @@ import (
 	"context"
 	"fmt"
 	"os/exec"
+	"regexp"
 	"runtime"
 	"strings"
 	"time"
@@ -53,6 +54,9 @@ type Options struct {
 	// Timeout overrides DefaultTimeout for this call.
 	// Values ≤ 0 use DefaultTimeout; values > MaxTimeout are clamped to MaxTimeout.
 	Timeout time.Duration
+
+	// SudoPassword is the password to use for sudo commands.
+	SudoPassword string
 }
 
 // Execute runs the given command string using the platform-appropriate shell.
@@ -91,7 +95,16 @@ func Execute(ctx context.Context, command string, opts ...Options) (*Result, err
 	case "windows":
 		cmd = exec.CommandContext(timeoutCtx, "powershell.exe", "-NoProfile", "-NonInteractive", "-Command", command)
 	default: // linux, darwin, etc.
+		var stdin bytes.Buffer
+		if opt.SudoPassword != "" {
+			re := regexp.MustCompile(`\bsudo\b`)
+			command = re.ReplaceAllString(command, "sudo -S")
+			command = strings.ReplaceAll(command, "sudo -S -S", "sudo -S")
+			command = strings.ReplaceAll(command, "sudo -S -s", "sudo -S -s")
+			stdin.WriteString(opt.SudoPassword + "\n")
+		}
 		cmd = exec.CommandContext(timeoutCtx, "/bin/bash", "-c", command)
+		cmd.Stdin = &stdin
 	}
 
 	if opt.WorkingDir != "" {
@@ -107,6 +120,11 @@ func Execute(ctx context.Context, command string, opts ...Options) (*Result, err
 	result := &Result{
 		Stdout: stdout.String(),
 		Stderr: stderr.String(),
+	}
+
+	if opt.SudoPassword != "" {
+		rePrompt := regexp.MustCompile(`(?m)^\[sudo\] password for .*: \n?`)
+		result.Stderr = rePrompt.ReplaceAllString(result.Stderr, "")
 	}
 
 	if err != nil {

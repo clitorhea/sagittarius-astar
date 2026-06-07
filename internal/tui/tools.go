@@ -601,7 +601,7 @@ func ExecuteToolWithWrite(call llm.ToolCall) (result string, pw *PendingWrite, e
 
 // ExecuteRunCommand executes a run_command call directly via the sandbox.
 // This is called by the TUI after user approval (or auto-approve).
-func ExecuteRunCommand(ctx context.Context, call llm.ToolCall) (string, error) {
+func ExecuteRunCommand(ctx context.Context, call llm.ToolCall, sudoPassword string) (string, error) {
 	command, _ := call.Args["command"].(string)
 	workingDir, _ := call.Args["working_dir"].(string)
 
@@ -611,8 +611,9 @@ func ExecuteRunCommand(ctx context.Context, call llm.ToolCall) (string, error) {
 	}
 
 	result, err := sandbox.Execute(ctx, command, sandbox.Options{
-		WorkingDir: workingDir,
-		Timeout:    timeoutDur,
+		WorkingDir:    workingDir,
+		Timeout:       timeoutDur,
+		SudoPassword:  sudoPassword,
 	})
 	if err != nil {
 		return "", err

@@ -24,6 +24,7 @@ import (
 	"github.com/charmbracelet/bubbles/progress"
 	"github.com/charmbracelet/bubbles/spinner"
 	"github.com/charmbracelet/bubbles/textarea"
+	"github.com/charmbracelet/bubbles/textinput"
 	"github.com/charmbracelet/bubbles/viewport"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/glamour"
@@ -49,6 +50,7 @@ const (
 	stateExecutingTools                 // Multiple agent tools executing concurrently.
 	stateConfirmingWrite                // Awaiting y/n for write_file tool.
 	stateSelecting                      // Selecting options (models, history, providers, personas)
+	stateInputSudoPassword              // Awaiting user input for sudo password.
 )
 
 // execLangs are the code fence tags that trigger the sandbox prompt.
@@ -112,13 +114,15 @@ type Model struct {
 	pendingWriteCallID string
 
 	// UI components
-	textarea    textarea.Model
-	cmdTextarea textarea.Model
-	viewport    viewport.Model
-	spinner     spinner.Model
-	progressBar progress.Model
-	execStart   time.Time
-	execTimeout time.Duration
+	textarea      textarea.Model
+	cmdTextarea   textarea.Model
+	sudoTextInput textinput.Model
+	viewport      viewport.Model
+	spinner       spinner.Model
+	progressBar   progress.Model
+	execStart     time.Time
+	execTimeout   time.Duration
+	sudoPassword  string
 
 	// Layout
 	width             int
@@ -184,12 +188,19 @@ func NewModel(provider llm.Provider, activeSession *session.Session, defaultSyst
 		apiKeys = make(map[string]string)
 	}
 
+	ti := textinput.New()
+	ti.Placeholder = "Enter sudo password..."
+	ti.EchoMode = textinput.EchoPassword
+	ti.EchoCharacter = '*'
+	ti.CharLimit = 128
+
 	m := &Model{
 		appState:            stateInput,
 		history:             activeSession.History,
 		provider:            provider,
 		textarea:            ta,
 		cmdTextarea:         cta,
+		sudoTextInput:       ti,
 		viewport:            vp,
 		spinner:             sp,
 		progressBar:         pg,
@@ -709,6 +720,90 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, nil
 			}
 
+		case stateInputSudoPassword:
+			// Check for viewport scroll keys first to allow reading long outputs.
+			if msg.Type == tea.KeyPgUp {
+				m.viewport.LineUp(m.viewport.Height)
+				return m, nil
+			}
+			if msg.Type == tea.KeyCtrlU {
+				m.viewport.LineUp(m.viewport.Height / 2)
+				return m, nil
+			}
+			if msg.Type == tea.KeyPgDown {
+				m.viewport.LineDown(m.viewport.Height)
+				return m, nil
+			}
+			if msg.Type == tea.KeyCtrlD {
+				m.viewport.LineDown(m.viewport.Height / 2)
+				return m, nil
+			}
+			if msg.String() == "alt+up" {
+				m.viewport.LineUp(1)
+				return m, nil
+			}
+			if msg.String() == "alt+down" {
+				m.viewport.LineDown(1)
+				return m, nil
+			}
+
+			switch msg.Type {
+			case tea.KeyEsc:
+				logger.L.Info("sudo: user declined password input")
+				m.appState = stateInput
+				m.sudoTextInput.Reset()
+				m.textarea.Focus()
+				m.appendOutput(confirmStyle.Render("✗ Command cancelled (sudo password required)."))
+				m.refreshViewport()
+				return m, nil
+			case tea.KeyEnter:
+				passwd := m.sudoTextInput.Value()
+				m.sudoPassword = passwd
+				m.sudoTextInput.Reset()
+				m.sudoTextInput.Blur()
+				
+				// Now resume command execution
+				cmd := m.pendingCmd
+				if m.pendingLang == "" && len(m.pendingToolCalls) > 0 {
+					// Tool call path
+					call := m.pendingToolCalls[m.pendingToolIdx]
+					m.appState = stateExecutingTool
+					m.execStart = time.Now()
+					m.execTimeout = sandbox.DefaultTimeout
+					if v, ok := call.Args["timeout_seconds"].(float64); ok && v > 0 {
+						m.execTimeout = time.Duration(v) * time.Second
+					}
+					m.appendOutput(confirmStyle.Render("⚡ Executing…"))
+					m.refreshViewport()
+					
+					// Patch the command
+					callCopy := call
+					callCopy.Args["command"] = cmd
+					ctx, cancel := context.WithCancel(context.Background())
+					m.cancelExec = cancel
+					return m, tea.Batch(func() tea.Msg {
+						out, err := ExecuteRunCommand(ctx, callCopy, m.sudoPassword)
+						cancel()
+						if err != nil {
+							return toolCallResultMsg{CallID: callCopy.ID, Name: callCopy.Name, Error: err}
+						}
+						return toolCallResultMsg{CallID: callCopy.ID, Name: callCopy.Name, Result: out}
+					}, m.spinner.Tick)
+				} else {
+					// Code block sandbox path
+					m.appState = stateExecuting
+					m.execStart = time.Now()
+					m.execTimeout = sandbox.DefaultTimeout
+					m.appendOutput(confirmStyle.Render("⚡ Executing…"))
+					m.refreshViewport()
+					return m, tea.Batch(m.runSandboxCmd(), m.spinner.Tick)
+				}
+			}
+			
+			var tiCmd tea.Cmd
+			m.sudoTextInput, tiCmd = m.sudoTextInput.Update(msg)
+			return m, tiCmd
+
 		case stateConfirmingCmd:
 			// Check for viewport scroll keys first to allow reading long outputs.
 			if msg.Type == tea.KeyPgUp {
@@ -769,6 +864,15 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				if m.pendingLang == "" && len(m.pendingToolCalls) > 0 {
 					call := m.pendingToolCalls[m.pendingToolIdx]
 					logger.L.Info("run_command tool: user approved", "command", cmd)
+					if m.needsSudo(cmd) && m.sudoPassword == "" {
+						m.appState = stateInputSudoPassword
+						m.pendingCmd = cmd
+						m.sudoTextInput.Focus()
+						m.cmdTextarea.Blur()
+						m.appendOutput(confirmStyle.Render("🔒 Sudo password required to execute command."))
+						m.refreshViewport()
+						return m, nil
+					}
 					m.appState = stateExecutingTool
 					m.execStart = time.Now()
 					m.execTimeout = sandbox.DefaultTimeout
@@ -784,7 +888,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					ctx, cancel := context.WithCancel(context.Background())
 					m.cancelExec = cancel
 					return m, tea.Batch(func() tea.Msg {
-						out, err := ExecuteRunCommand(ctx, callCopy)
+						out, err := ExecuteRunCommand(ctx, callCopy, m.sudoPassword)
 						cancel()
 						if err != nil {
 							return toolCallResultMsg{CallID: callCopy.ID, Name: callCopy.Name, Error: err}
@@ -797,6 +901,14 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					"command", cmd,
 				)
 				m.pendingCmd = cmd
+				if m.needsSudo(cmd) && m.sudoPassword == "" {
+					m.appState = stateInputSudoPassword
+					m.sudoTextInput.Focus()
+					m.cmdTextarea.Blur()
+					m.appendOutput(confirmStyle.Render("🔒 Sudo password required to execute command."))
+					m.refreshViewport()
+					return m, nil
+				}
 				m.appState = stateExecuting
 				m.execStart = time.Now()
 				m.execTimeout = sandbox.DefaultTimeout
@@ -1056,6 +1168,11 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if msg.err != nil {
 			logger.L.Error("sandbox: execution error", "error", msg.err)
 			m.appendOutput(errorStyle.Render("✗ Execution error: " + msg.err.Error()))
+			errStr := strings.ToLower(msg.err.Error())
+			if strings.Contains(errStr, "incorrect password") || strings.Contains(errStr, "permission denied") {
+				m.sudoPassword = ""
+				m.appendOutput(errorStyle.Render("🔒 Incorrect password or permission denied. Sudo password cache cleared."))
+			}
 		} else {
 			logger.L.Info("sandbox: execution completed",
 				"lang", m.pendingLang,
@@ -1064,6 +1181,12 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			label := lipgloss.NewStyle().Foreground(colorGreen).Bold(true).Render("$ " + m.pendingLang)
 			m.appendOutput(label)
 			m.appendOutput(execResultStyle.Render(msg.output))
+			
+			outStr := strings.ToLower(msg.output)
+			if strings.Contains(outStr, "incorrect password") || strings.Contains(outStr, "try again") {
+				m.sudoPassword = ""
+				m.appendOutput(errorStyle.Render("🔒 Sudo authentication failed. Sudo password cache cleared."))
+			}
 
 			// Feed output back into conversation as a system message.
 			m.history = append(m.history, llm.Message{
@@ -1117,8 +1240,24 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if msg.Error != nil {
 			resContent = fmt.Sprintf("Error: %s", msg.Error.Error())
 			m.appendOutput(errorStyle.Render(fmt.Sprintf("✗ Tool %s failed", msg.Name)))
+			if msg.Name == "run_command" {
+				m.appendOutput(errorStyle.Render("✗ " + msg.Error.Error()))
+				errStr := strings.ToLower(msg.Error.Error())
+				if strings.Contains(errStr, "incorrect password") || strings.Contains(errStr, "permission denied") {
+					m.sudoPassword = ""
+					m.appendOutput(errorStyle.Render("🔒 Incorrect password or permission denied. Sudo password cache cleared."))
+				}
+			}
 		} else {
 			m.appendOutput(lipgloss.NewStyle().Foreground(colorGreen).Render(fmt.Sprintf("✓ Tool %s done", msg.Name)))
+			if msg.Name == "run_command" {
+				m.appendOutput(execResultStyle.Render(msg.Result))
+				outStr := strings.ToLower(msg.Result)
+				if strings.Contains(outStr, "incorrect password") || strings.Contains(outStr, "try again") {
+					m.sudoPassword = ""
+					m.appendOutput(errorStyle.Render("🔒 Sudo authentication failed. Sudo password cache cleared."))
+				}
+			}
 		}
 		m.refreshViewport()
 
@@ -1154,6 +1293,10 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		var taCmd tea.Cmd
 		m.textarea, taCmd = m.textarea.Update(msg)
 		cmds = append(cmds, taCmd)
+	} else if m.appState == stateInputSudoPassword {
+		var tiCmd tea.Cmd
+		m.sudoTextInput, tiCmd = m.sudoTextInput.Update(msg)
+		cmds = append(cmds, tiCmd)
 	}
 	{
 		var vpCmd tea.Cmd
@@ -1224,53 +1367,51 @@ func (m Model) View() string {
 				m.cmdTextarea.View(),
 			),
 		))
+	case stateInputSudoPassword:
+		b.WriteString(inputActiveStyle.Render(
+			lipgloss.JoinVertical(lipgloss.Left,
+				confirmStyle.Render("🔒 This command requires sudo. Enter password (Esc to cancel):"),
+				m.sudoTextInput.View(),
+			),
+		))
 	case stateExecuting:
+		icon, desc := m.getExecutionIndicator(m.pendingCmd)
 		elapsed := time.Since(m.execStart)
-		pct := 0.0
-		if m.execTimeout > 0 {
-			pct = float64(elapsed) / float64(m.execTimeout)
-		}
-		if pct > 1.0 {
-			pct = 1.0
-		}
-		bar := m.progressBar.ViewAs(pct)
-		durationInfo := fmt.Sprintf(" (%.1fs / %.1fs)", elapsed.Seconds(), m.execTimeout.Seconds())
-		cmdMsg := "running command…"
+		cmdMsg := desc
 		if m.pendingCmd != "" {
 			trimmedCmd := m.pendingCmd
 			if len(trimmedCmd) > 50 {
 				trimmedCmd = trimmedCmd[:47] + "..."
 			}
-			cmdMsg = fmt.Sprintf("running command: %s (Ctrl+C to kill)", trimmedCmd)
-		} else {
-			cmdMsg = "running command… (Ctrl+C to kill)"
+			cmdMsg = fmt.Sprintf("%s: %s", desc, trimmedCmd)
 		}
 		b.WriteString(inputStyle.Render(
-			lipgloss.JoinVertical(lipgloss.Left,
-				m.spinner.View()+" "+lipgloss.NewStyle().Foreground(colorSubtext).Render(cmdMsg),
-				bar+durationInfo,
-			),
+			fmt.Sprintf("%s %s %s (elapsed: %.1fs)", m.spinner.View(), icon, cmdMsg, elapsed.Seconds()),
 		))
 	case stateExecutingTool:
 		elapsed := time.Since(m.execStart)
-		pct := 0.0
-		if m.execTimeout > 0 {
-			pct = float64(elapsed) / float64(m.execTimeout)
-		}
-		if pct > 1.0 {
-			pct = 1.0
-		}
-		bar := m.progressBar.ViewAs(pct)
-		durationInfo := fmt.Sprintf(" (%.1fs / %.1fs)", elapsed.Seconds(), m.execTimeout.Seconds())
-		toolMsg := "executing tool…"
+		toolName := "tool"
+		command := ""
 		if len(m.pendingToolCalls) > 0 && m.pendingToolIdx < len(m.pendingToolCalls) {
-			toolMsg = fmt.Sprintf("executing tool: %s…", m.pendingToolCalls[m.pendingToolIdx].Name)
+			call := m.pendingToolCalls[m.pendingToolIdx]
+			toolName = call.Name
+			if toolName == "run_command" {
+				command, _ = call.Args["command"].(string)
+			}
+		}
+		var icon, desc string
+		if toolName == "run_command" && command != "" {
+			icon, desc = m.getExecutionIndicator(command)
+			if len(command) > 50 {
+				command = command[:47] + "..."
+			}
+			desc = fmt.Sprintf("%s: %s", desc, command)
+		} else {
+			icon = "⚙"
+			desc = fmt.Sprintf("executing tool: %s…", toolName)
 		}
 		b.WriteString(inputStyle.Render(
-			lipgloss.JoinVertical(lipgloss.Left,
-				m.spinner.View()+" "+lipgloss.NewStyle().Foreground(colorSubtext).Render(toolMsg),
-				bar+durationInfo,
-			),
+			fmt.Sprintf("%s %s %s (elapsed: %.1fs)", m.spinner.View(), icon, desc, elapsed.Seconds()),
 		))
 	case stateExecutingTools:
 		remaining := len(m.pendingToolCalls) - m.pendingToolIdx
@@ -1540,8 +1681,14 @@ func (m *Model) loadHistory(history []llm.Message) {
 		} else if msg.Role == llm.RoleTool {
 			if strings.HasPrefix(msg.Content, "Error:") {
 				m.outputLines = append(m.outputLines, errorStyle.Render(fmt.Sprintf("✗ Tool %s failed", msg.ToolName)))
+				if msg.ToolName == "run_command" {
+					m.outputLines = append(m.outputLines, errorStyle.Render(msg.Content))
+				}
 			} else {
 				m.outputLines = append(m.outputLines, lipgloss.NewStyle().Foreground(colorGreen).Render(fmt.Sprintf("✓ Tool %s done", msg.ToolName)))
+				if msg.ToolName == "run_command" {
+					m.outputLines = append(m.outputLines, execResultStyle.Render(msg.Content))
+				}
 			}
 			// Add divider if next is a user message
 			nextIsUser := false
@@ -1639,6 +1786,38 @@ func (m *Model) loadHistory(history []llm.Message) {
 
 	m.refreshViewport()}
 
+func (m *Model) needsSudo(cmd string) bool {
+	matched, _ := regexp.MatchString(`\bsudo\b`, cmd)
+	return matched
+}
+
+func (m *Model) getExecutionIndicator(cmd string) (string, string) {
+	cmdLower := strings.ToLower(cmd)
+	isSudo := m.needsSudo(cmd)
+	isDownload := false
+	downloadKeywords := []string{
+		"curl", "wget", "git clone", "apt-get install", "apt install",
+		"npm install", "npm i ", "pip install", "go get", "docker pull",
+		"yarn add", "wget ", "download",
+	}
+	for _, kw := range downloadKeywords {
+		if strings.Contains(cmdLower, kw) {
+			isDownload = true
+			break
+		}
+	}
+	if isDownload {
+		if isSudo {
+			return "📥", "downloading & installing with sudo…"
+		}
+		return "📥", "downloading…"
+	}
+	if isSudo {
+		return "🔒", "running with sudo…"
+	}
+	return "⚙", "running command…"
+}
+
 // recalculateDimensions calculates dynamic layout heights and widths to prevent overflow or underflow.
 func (m *Model) recalculateDimensions() {
 	if m.width == 0 || m.height == 0 {
@@ -1647,6 +1826,7 @@ func (m *Model) recalculateDimensions() {
 	m.viewport.Width = m.width
 	m.textarea.SetWidth(m.width - 4)
 	m.cmdTextarea.SetWidth(m.width - 4)
+	m.sudoTextInput.Width = m.width - 4
 
 	overhead := 7
 
@@ -1660,6 +1840,8 @@ func (m *Model) recalculateDimensions() {
 		inputHeight = 8
 	case stateConfirmingWrite:
 		inputHeight = 8
+	case stateInputSudoPassword:
+		inputHeight = 4
 	case stateExecuting:
 		inputHeight = 4
 	case stateExecutingTool:
@@ -1805,7 +1987,9 @@ func (m *Model) runSandboxCmd() tea.Cmd {
 	ctx, cancel := context.WithCancel(context.Background())
 	m.cancelExec = cancel
 	return func() tea.Msg {
-		result, err := sandbox.Execute(ctx, cmd)
+		result, err := sandbox.Execute(ctx, cmd, sandbox.Options{
+			SudoPassword: m.sudoPassword,
+		})
 		if err != nil {
 			return execResultMsg{err: err}
 		}
@@ -1828,6 +2012,17 @@ func (m *Model) processNextToolCall() tea.Cmd {
 		command, _ := call.Args["command"].(string)
 
 		if m.autoApproveCommands {
+			if m.needsSudo(command) && m.sudoPassword == "" {
+				m.appState = stateInputSudoPassword
+				m.pendingCmd = command
+				m.pendingLang = "" // tool call
+				m.sudoTextInput.Focus()
+				m.textarea.Blur()
+				m.appendOutput(confirmStyle.Render("🔒 Sudo password required to execute auto-approved command."))
+				m.refreshViewport()
+				return nil
+			}
+
 			// Execute immediately without asking.
 			m.appState = stateExecutingTool
 			m.execStart = time.Now()
@@ -1842,7 +2037,7 @@ func (m *Model) processNextToolCall() tea.Cmd {
 			ctx, cancel := context.WithCancel(context.Background())
 			m.cancelExec = cancel
 			return tea.Batch(func() tea.Msg {
-				out, err := ExecuteRunCommand(ctx, callCopy)
+				out, err := ExecuteRunCommand(ctx, callCopy, m.sudoPassword)
 				cancel()
 				if err != nil {
 					return toolCallResultMsg{CallID: callCopy.ID, Name: callCopy.Name, Error: err}
@@ -1968,6 +2163,8 @@ func (m Model) statusBar() string {
 		statusText = "⚙ executing tool"
 	case stateConfirmingWrite:
 		statusText = "💾 write pending"
+	case stateInputSudoPassword:
+		statusText = "🔒 entering sudo password"
 	default:
 		statusText = "● ready"
 	}
