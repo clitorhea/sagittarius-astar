@@ -197,8 +197,17 @@ func PersonaList(fc *FileConfig) []string {
 }
 
 // ResolvePersona returns the system prompt string for the given persona name,
-// consulting user-defined personas first, then built-in defaults.
+// consulting the filesystem first if the name is an existing file, then
+// user-defined personas, then built-in defaults.
 func ResolvePersona(name string, fc *FileConfig) (string, bool) {
+	if name != "" {
+		if info, err := os.Stat(name); err == nil && !info.IsDir() {
+			if data, err := os.ReadFile(name); err == nil {
+				return string(data), true
+			}
+		}
+	}
+
 	name = strings.ToLower(name)
 	if fc != nil {
 		if prompt, ok := fc.Personas[name]; ok {
@@ -317,25 +326,47 @@ func Load(providerOverride ProviderName, modelOverride string, personaName strin
 
 	// 4. Resolve System Prompt (Persona)
 	if personaName == "" {
-		personaName = fc.DefaultPersona
+		if info, err := os.Stat("aig.md"); err == nil && !info.IsDir() {
+			personaName = "aig.md"
+		} else {
+			personaName = fc.DefaultPersona
+		}
 	}
 	if personaName == "" {
 		personaName = "coder"
 	}
-	personaName = strings.ToLower(personaName)
 
-	systemPrompt := defaultPersonas["coder"]
-	if fc.Personas != nil {
-		if prompt, ok := fc.Personas[personaName]; ok {
+	var systemPrompt string
+	var ok bool
+
+	// Check if personaName is a file path first, before lowercasing, to preserve path casing
+	if info, err := os.Stat(personaName); err == nil && !info.IsDir() {
+		if data, err := os.ReadFile(personaName); err == nil {
+			systemPrompt = string(data)
+			ok = true
+		}
+	}
+
+	if !ok {
+		lowerPersona := strings.ToLower(personaName)
+		if fc.Personas != nil {
+			if prompt, ok2 := fc.Personas[lowerPersona]; ok2 {
+				systemPrompt = prompt
+				ok = true
+			} else if prompt, ok2 := defaultPersonas[lowerPersona]; ok2 {
+				systemPrompt = prompt
+				ok = true
+			}
+		} else if prompt, ok2 := defaultPersonas[lowerPersona]; ok2 {
 			systemPrompt = prompt
-		} else if prompt, ok := defaultPersonas[personaName]; ok {
-			systemPrompt = prompt
-		} else {
+			ok = true
+		}
+	}
+
+	if !ok {
+		if fc.Personas != nil {
 			return nil, fmt.Errorf("unknown persona %q. Available personas in config: %v", personaName, getKeys(fc.Personas))
 		}
-	} else if prompt, ok := defaultPersonas[personaName]; ok {
-		systemPrompt = prompt
-	} else {
 		return nil, fmt.Errorf("unknown persona %q (valid default options: default, sysadmin, coder)", personaName)
 	}
 
