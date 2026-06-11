@@ -229,6 +229,15 @@ func (m Model) Init() tea.Cmd {
 
 // Update is the central message dispatcher.
 func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+	oldState := m.appState
+	concreteModel, cmd := m.update(msg)
+	if concreteModel.appState != oldState {
+		concreteModel.recalculateDimensions()
+	}
+	return concreteModel, cmd
+}
+
+func (m Model) update(msg tea.Msg) (Model, tea.Cmd) {
 	var cmds []tea.Cmd
 
 	switch msg := msg.(type) {
@@ -238,7 +247,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.width = msg.Width
 		m.height = msg.Height
 		m.recalculateDimensions()
-		m.loadHistory(m.history)
+		m.loadHistory(m.history, true) // preserve scroll position on resize
 
 	// ── Spinner tick ───────────────────────────────────────────────────────
 	case spinner.TickMsg:
@@ -522,7 +531,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 							m.appendOutput(errorStyle.Render("✗ Failed to load session: " + err.Error()))
 						} else {
 							m.activeSession = s
-							m.loadHistory(s.History)
+							m.loadHistory(s.History, false)
 							m.titleGenerated = false
 							m.appendOutput(lipgloss.NewStyle().Foreground(colorGreen).Render("Loaded session: " + s.ID))
 						}
@@ -735,6 +744,33 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.titleGenerated = false
 				m.saveSession()
 				m.refreshViewport()
+				return m, nil
+			}
+
+			// Viewport scroll while in input mode (explicit bindings so that
+			// typing normal characters like f/b/j/k/d/u doesn't scroll).
+			if msg.Type == tea.KeyPgUp {
+				m.viewport.LineUp(m.viewport.Height)
+				return m, nil
+			}
+			if msg.Type == tea.KeyPgDown {
+				m.viewport.LineDown(m.viewport.Height)
+				return m, nil
+			}
+			if msg.Type == tea.KeyCtrlU {
+				m.viewport.LineUp(m.viewport.Height / 2)
+				return m, nil
+			}
+			if msg.Type == tea.KeyCtrlD {
+				m.viewport.LineDown(m.viewport.Height / 2)
+				return m, nil
+			}
+			if msg.String() == "alt+up" {
+				m.viewport.LineUp(1)
+				return m, nil
+			}
+			if msg.String() == "alt+down" {
+				m.viewport.LineDown(1)
 				return m, nil
 			}
 
@@ -1344,7 +1380,12 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.sudoTextInput, tiCmd = m.sudoTextInput.Update(msg)
 		cmds = append(cmds, tiCmd)
 	}
-	{
+	// Only delegate to the viewport when the textarea is NOT focused.
+	// This prevents the viewport's built-in key bindings (arrows, pgup/pgdn)
+	// from stealing keystrokes meant for the text input, which causes
+	// scroll position jumps on Windows when the user types while scrolled up.
+	_, isKeyMsg := msg.(tea.KeyMsg)
+	if !isKeyMsg || (m.appState != stateInput && m.appState != stateInputSudoPassword) {
 		var vpCmd tea.Cmd
 		m.viewport, vpCmd = m.viewport.Update(msg)
 		cmds = append(cmds, vpCmd)
@@ -1354,8 +1395,6 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.spinner, spCmd = m.spinner.Update(msg)
 		cmds = append(cmds, spCmd)
 	}
-
-	m.recalculateDimensions()
 
 	return m, tea.Batch(cmds...)
 }
@@ -1549,7 +1588,7 @@ func (m Model) handleSelection(id string) (Model, tea.Cmd) {
 				m.provider = newProvider
 			}
 		}
-		m.loadHistory(s.History)
+		m.loadHistory(s.History, false)
 		m.titleGenerated = false
 		m.appendOutput(lipgloss.NewStyle().Foreground(colorGreen).Render("Loaded session: " + s.ID))
 		return m, nil
@@ -1655,7 +1694,10 @@ func (m Model) generateSessionTitleCmd() tea.Cmd {
 // ── Internal helpers ──────────────────────────────────────────────────────────
 
 // loadHistory updates the model's history and fully renders it to the viewport display.
-func (m *Model) loadHistory(history []llm.Message) {
+// When keepScroll is true, the viewport's current scroll offset is preserved
+// (used during window resize). When false, the viewport scrolls to the bottom
+// (used when loading a new session).
+func (m *Model) loadHistory(history []llm.Message, keepScroll bool) {
 	m.outputLines = nil
 	m.history = history
 
@@ -1830,7 +1872,12 @@ func (m *Model) loadHistory(history []llm.Message) {
 		}
 	}
 
-	m.refreshViewport()}
+	if keepScroll {
+		m.refreshViewportKeepPosition()
+	} else {
+		m.refreshViewport()
+	}
+}
 
 func (m *Model) needsSudo(cmd string) bool {
 	matched, _ := regexp.MatchString(`\bsudo\b`, cmd)
@@ -2169,11 +2216,32 @@ func (m *Model) processNextToolCall() tea.Cmd {
 }
 
 
-// refreshViewport re-renders all output lines into the viewport.
+// refreshViewport re-renders all output lines into the viewport and scrolls
+// to the bottom. Use this when new content has been appended (e.g. a new
+// message, command output, tool result).
 func (m *Model) refreshViewport() {
 	content := strings.Join(m.outputLines, "\n")
 	m.viewport.SetContent(content)
 	m.viewport.GotoBottom()
+}
+
+// refreshViewportKeepPosition re-renders output lines into the viewport while
+// preserving the current scroll offset. Use this during resize and re-layout
+// operations where no new content was added, so the user's reading position
+// is not lost.
+func (m *Model) refreshViewportKeepPosition() {
+	prevOffset := m.viewport.YOffset
+	content := strings.Join(m.outputLines, "\n")
+	m.viewport.SetContent(content)
+	// Clamp the offset so it doesn't exceed the new content length.
+	maxOffset := m.viewport.TotalLineCount() - m.viewport.VisibleLineCount()
+	if maxOffset < 0 {
+		maxOffset = 0
+	}
+	if prevOffset > maxOffset {
+		prevOffset = maxOffset
+	}
+	m.viewport.SetYOffset(prevOffset)
 }
 
 // refreshViewportStreaming appends the current streaming buffer as a preview.
