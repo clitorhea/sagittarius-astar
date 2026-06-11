@@ -601,7 +601,9 @@ func ExecuteToolWithWrite(call llm.ToolCall) (result string, pw *PendingWrite, e
 
 // ExecuteRunCommand executes a run_command call directly via the sandbox.
 // This is called by the TUI after user approval (or auto-approve).
-func ExecuteRunCommand(ctx context.Context, call llm.ToolCall, sudoPassword string) (string, error) {
+// stdin may be nil (falls back to the default sudo-seed buffer via sandbox.Execute),
+// or an io.Reader (e.g. an io.Pipe read-end for interactive mid-run input injection).
+func ExecuteRunCommand(ctx context.Context, call llm.ToolCall, sudoPassword string, stdin io.Reader) (string, error) {
 	command, _ := call.Args["command"].(string)
 	workingDir, _ := call.Args["working_dir"].(string)
 
@@ -610,16 +612,25 @@ func ExecuteRunCommand(ctx context.Context, call llm.ToolCall, sudoPassword stri
 		timeoutDur = time.Duration(v) * time.Second
 	}
 
-	result, err := sandbox.Execute(ctx, command, sandbox.Options{
-		WorkingDir:    workingDir,
-		Timeout:       timeoutDur,
-		SudoPassword:  sudoPassword,
-	})
+	opts := sandbox.Options{
+		WorkingDir:   workingDir,
+		Timeout:      timeoutDur,
+		SudoPassword: sudoPassword,
+	}
+
+	var result *sandbox.Result
+	var err error
+	if stdin != nil {
+		result, err = sandbox.ExecuteWithStdin(ctx, command, stdin, opts)
+	} else {
+		result, err = sandbox.Execute(ctx, command, opts)
+	}
 	if err != nil {
 		return "", err
 	}
 	return result.Combined(), nil
 }
+
 
 // ── Internal helpers ──────────────────────────────────────────────────────────
 

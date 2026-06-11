@@ -16,6 +16,7 @@ package tui
 import (
 	"context"
 	"fmt"
+	"io"
 	"os"
 	"regexp"
 	"strings"
@@ -51,6 +52,7 @@ const (
 	stateConfirmingWrite                // Awaiting y/n for write_file tool.
 	stateSelecting                      // Selecting options (models, history, providers, personas)
 	stateInputSudoPassword              // Awaiting user input for sudo password.
+	stateRuntimeInput                   // Sending a stdin line to an already-running process.
 )
 
 // execLangs are the code fence tags that trigger the sandbox prompt.
@@ -108,6 +110,13 @@ type Model struct {
 
 	// cancelExec cancels a running sandbox child process without quitting the app.
 	cancelExec context.CancelFunc
+
+	// stdinPipe is the write end of the pipe connected to the running process's stdin.
+	// Non-nil only while stateExecuting or stateExecutingTool with a pipe-based command.
+	stdinPipe io.WriteCloser
+
+	// runtimeInput is the single-line input box shown in stateRuntimeInput.
+	runtimeInput textinput.Model
 
 	// Pending write_file confirmation
 	pendingWrite *PendingWrite
@@ -196,6 +205,10 @@ func NewModel(provider llm.Provider, activeSession *session.Session, defaultSyst
 	ti.EchoCharacter = '*'
 	ti.CharLimit = 128
 
+	ri := textinput.New()
+	ri.Placeholder = "Type input for the running process and press Enter to send..."
+	ri.CharLimit = 1024
+
 	m := &Model{
 		appState:            stateInput,
 		history:             activeSession.History,
@@ -203,6 +216,7 @@ func NewModel(provider llm.Provider, activeSession *session.Session, defaultSyst
 		textarea:            ta,
 		cmdTextarea:         cta,
 		sudoTextInput:       ti,
+		runtimeInput:        ri,
 		viewport:            vp,
 		spinner:             sp,
 		progressBar:         pg,
@@ -863,9 +877,16 @@ func (m Model) update(msg tea.Msg) (Model, tea.Cmd) {
 					callCopy.Args["command"] = cmd
 					ctx, cancel := context.WithCancel(context.Background())
 					m.cancelExec = cancel
+					pipeR, pipeW := io.Pipe()
+					m.stdinPipe = pipeW
+					// Pre-seed sudo password if needed.
+					if m.sudoPassword != "" {
+						_, _ = fmt.Fprintln(pipeW, m.sudoPassword)
+					}
 					return m, tea.Batch(func() tea.Msg {
-						out, err := ExecuteRunCommand(ctx, callCopy, m.sudoPassword)
+						out, err := ExecuteRunCommand(ctx, callCopy, m.sudoPassword, pipeR)
 						cancel()
+						_ = pipeR.Close()
 						if err != nil {
 							return toolCallResultMsg{CallID: callCopy.ID, Name: callCopy.Name, Error: err}
 						}
@@ -969,9 +990,15 @@ func (m Model) update(msg tea.Msg) (Model, tea.Cmd) {
 					callCopy.Args["command"] = cmd
 					ctx, cancel := context.WithCancel(context.Background())
 					m.cancelExec = cancel
+					pipeR, pipeW := io.Pipe()
+					m.stdinPipe = pipeW
+					if m.sudoPassword != "" {
+						_, _ = fmt.Fprintln(pipeW, m.sudoPassword)
+					}
 					return m, tea.Batch(func() tea.Msg {
-						out, err := ExecuteRunCommand(ctx, callCopy, m.sudoPassword)
+						out, err := ExecuteRunCommand(ctx, callCopy, m.sudoPassword, pipeR)
 						cancel()
+						_ = pipeR.Close()
 						if err != nil {
 							return toolCallResultMsg{CallID: callCopy.ID, Name: callCopy.Name, Error: err}
 						}
@@ -1007,18 +1034,100 @@ func (m Model) update(msg tea.Msg) (Model, tea.Cmd) {
 			return m, cmd
 
 		case stateExecuting:
+			// Ctrl+I opens the runtime stdin prompt.
+			if msg.Type == tea.KeyCtrlI {
+				if m.stdinPipe != nil {
+					m.appState = stateRuntimeInput
+					m.runtimeInput.Reset()
+					m.runtimeInput.Focus()
+					return m, nil
+				}
+			}
 			// Ctrl+C kills the child process without quitting aig.
 			if msg.Type == tea.KeyCtrlC {
-				if m.cancelExec != nil {
-					m.cancelExec()
-					m.cancelExec = nil
-				}
+				m.killExec()
 				logger.L.Warn("sandbox: execution killed by user")
 				m.appState = stateInput
 				m.appendOutput(errorStyle.Render("✗ Command killed."))
 				m.refreshViewport()
 				return m, nil
 			}
+
+		case stateExecutingTool:
+			// Ctrl+I opens the runtime stdin prompt when a pipe is active.
+			if msg.Type == tea.KeyCtrlI {
+				if m.stdinPipe != nil {
+					m.appState = stateRuntimeInput
+					m.runtimeInput.Reset()
+					m.runtimeInput.Focus()
+					return m, nil
+				}
+			}
+			// Ctrl+C aborts the tool and sends an error result to unblock the chain.
+			if msg.Type == tea.KeyCtrlC {
+				m.killExec()
+				logger.L.Warn("tool: execution killed by user")
+				m.appendOutput(errorStyle.Render("✗ Tool aborted."))
+				m.refreshViewport()
+				// Send an error result so the pending-tool chain moves on (or the
+				// LLM gets an error response instead of hanging forever).
+				if len(m.pendingToolCalls) > 0 && m.pendingToolIdx < len(m.pendingToolCalls) {
+					call := m.pendingToolCalls[m.pendingToolIdx]
+					m.pendingToolIdx++
+					if m.pendingToolIdx < len(m.pendingToolCalls) {
+						// More tools remain — send error result and continue chain.
+						return m, func() tea.Msg {
+							return toolCallResultMsg{CallID: call.ID, Name: call.Name, Error: fmt.Errorf("aborted by user")}
+						}
+					}
+					// Last tool — send error result and reset to input.
+					m.pendingToolCalls = nil
+					m.pendingToolIdx = 0
+					m.appState = stateInput
+					m.textarea.Focus()
+					return m, func() tea.Msg {
+						return toolCallResultMsg{CallID: call.ID, Name: call.Name, Error: fmt.Errorf("aborted by user")}
+					}
+				}
+				m.pendingToolCalls = nil
+				m.pendingToolIdx = 0
+				m.appState = stateInput
+				m.textarea.Focus()
+				return m, nil
+			}
+
+		case stateRuntimeInput:
+			switch msg.Type {
+			case tea.KeyEsc:
+				// Go back to executing state without sending anything.
+				m.runtimeInput.Blur()
+				m.appState = stateExecuting
+				if len(m.pendingToolCalls) > 0 {
+					m.appState = stateExecutingTool
+				}
+				return m, nil
+			case tea.KeyEnter:
+				line := m.runtimeInput.Value()
+				m.runtimeInput.Reset()
+				m.runtimeInput.Blur()
+				m.appState = stateExecuting
+				if len(m.pendingToolCalls) > 0 {
+					m.appState = stateExecutingTool
+				}
+				if m.stdinPipe != nil {
+					m.appendOutput(lipgloss.NewStyle().Foreground(colorSubtext).Render("> " + line))
+					m.refreshViewport()
+					pipe := m.stdinPipe
+					return m, func() tea.Msg {
+						_, _ = fmt.Fprintln(pipe, line)
+						return nil
+					}
+				}
+				return m, nil
+			}
+			var riCmd tea.Cmd
+			m.runtimeInput, riCmd = m.runtimeInput.Update(msg)
+			return m, riCmd
 
 		case stateConfirmingWrite:
 			// Check for viewport scroll keys first to allow reading long outputs.
@@ -1279,6 +1388,11 @@ func (m Model) update(msg tea.Msg) (Model, tea.Cmd) {
 		}
 		m.pendingCmd = ""
 		m.pendingLang = ""
+		// Close and discard the stdin pipe now that the command has finished.
+		if m.stdinPipe != nil {
+			_ = m.stdinPipe.Close()
+			m.stdinPipe = nil
+		}
 		m.resetToInput()
 		return m, nil
 
@@ -1340,6 +1454,11 @@ func (m Model) update(msg tea.Msg) (Model, tea.Cmd) {
 					m.appendOutput(errorStyle.Render("🔒 Sudo authentication failed. Sudo password cache cleared."))
 				}
 			}
+		}
+		// Close the stdin pipe for this tool (if it had one).
+		if m.stdinPipe != nil {
+			_ = m.stdinPipe.Close()
+			m.stdinPipe = nil
 		}
 		m.refreshViewport()
 
@@ -1470,8 +1589,17 @@ func (m Model) View() string {
 			}
 			cmdMsg = fmt.Sprintf("%s: %s", desc, trimmedCmd)
 		}
+		var execHints []string
+		execHints = append(execHints, fmt.Sprintf("%s %s %s (elapsed: %.1fs)", m.spinner.View(), icon, cmdMsg, elapsed.Seconds()))
+		if m.stdinPipe != nil {
+			execHints = append(execHints, lipgloss.NewStyle().Foreground(colorSubtext).Render(
+				"Ctrl+I to send stdin · Ctrl+C to abort"))
+		} else {
+			execHints = append(execHints, lipgloss.NewStyle().Foreground(colorSubtext).Render(
+				"Ctrl+C to abort"))
+		}
 		b.WriteString(inputStyle.Render(
-			fmt.Sprintf("%s %s %s (elapsed: %.1fs)", m.spinner.View(), icon, cmdMsg, elapsed.Seconds()),
+			lipgloss.JoinVertical(lipgloss.Left, execHints...),
 		))
 	case stateExecutingTool:
 		elapsed := time.Since(m.execStart)
@@ -1496,7 +1624,16 @@ func (m Model) View() string {
 			desc = fmt.Sprintf("executing tool: %s…", toolName)
 		}
 		b.WriteString(inputStyle.Render(
-			fmt.Sprintf("%s %s %s (elapsed: %.1fs)", m.spinner.View(), icon, desc, elapsed.Seconds()),
+			lipgloss.JoinVertical(lipgloss.Left,
+				fmt.Sprintf("%s %s %s (elapsed: %.1fs)", m.spinner.View(), icon, desc, elapsed.Seconds()),
+				lipgloss.NewStyle().Foreground(colorSubtext).Render(
+					func() string {
+						if m.stdinPipe != nil {
+							return "Ctrl+I to send stdin \u00b7 Ctrl+C to abort"
+						}
+						return "Ctrl+C to abort"
+					}()),
+			),
 		))
 	case stateExecutingTools:
 		remaining := len(m.pendingToolCalls) - m.pendingToolIdx
@@ -1535,6 +1672,15 @@ func (m Model) View() string {
 		}
 		b.WriteString(inputActiveStyle.Render(
 			lipgloss.JoinVertical(lipgloss.Left, items...),
+		))
+	case stateRuntimeInput:
+		hint := lipgloss.NewStyle().Foreground(colorSubtext).Render(
+			"\u2328\ufe0f  Type a line to send to the running process (Enter to send \u00b7 Esc to return)")
+		b.WriteString(inputActiveStyle.Render(
+			lipgloss.JoinVertical(lipgloss.Left,
+				hint,
+				m.runtimeInput.View(),
+			),
 		))
 	}
 
@@ -1920,6 +2066,7 @@ func (m *Model) recalculateDimensions() {
 	m.textarea.SetWidth(m.width - 4)
 	m.cmdTextarea.SetWidth(m.width - 4)
 	m.sudoTextInput.Width = m.width - 4
+	m.runtimeInput.Width = m.width - 4
 
 	overhead := 7
 
@@ -1941,6 +2088,8 @@ func (m *Model) recalculateDimensions() {
 		inputHeight = 4
 	case stateExecutingTools:
 		inputHeight = 3
+	case stateRuntimeInput:
+		inputHeight = 4
 	case stateSelecting:
 		itemsCount := len(m.selectionItems)
 		if itemsCount > 4 {
@@ -2056,6 +2205,18 @@ func waitForToken(ch chan string) tea.Cmd {
 	}
 }
 
+// killExec cancels any in-flight sandbox child process and cleans up the stdin pipe.
+func (m *Model) killExec() {
+	if m.stdinPipe != nil {
+		_ = m.stdinPipe.Close()
+		m.stdinPipe = nil
+	}
+	if m.cancelExec != nil {
+		m.cancelExec()
+		m.cancelExec = nil
+	}
+}
+
 // resetToInput transitions the TUI back to the interactive input state.
 // It must be called from every path that returns to stateInput to ensure
 // the main textarea is re-focused and any in-flight streams are cancelled.
@@ -2073,20 +2234,34 @@ func (m *Model) resetToInput() {
 }
 
 // runSandboxCmd executes the pending command in the sandbox.
-// It creates a cancellable context and stores the cancel func so the TUI
-// can kill the child process on Ctrl+C without quitting the whole app.
+// It creates a cancellable context, an io.Pipe for stdin (enabling runtime
+// input injection via Ctrl+I), and stores both so the TUI can kill or feed
+// the child process without quitting the whole app.
 func (m *Model) runSandboxCmd() tea.Cmd {
 	cmd := m.pendingCmd
 	ctx, cancel := context.WithCancel(context.Background())
 	m.cancelExec = cancel
+
+	// Create a pipe: the TUI writes to pipeW, the subprocess reads from pipeR.
+	pipeR, pipeW := io.Pipe()
+	m.stdinPipe = pipeW
+
+	// Pre-seed the sudo password if needed, then keep the write end open so
+	// the process can receive further input via Ctrl+I.
+	if m.sudoPassword != "" {
+		_, _ = fmt.Fprintln(pipeW, m.sudoPassword)
+	}
+
 	return func() tea.Msg {
-		result, err := sandbox.Execute(ctx, cmd, sandbox.Options{
+		result, err := sandbox.ExecuteWithStdin(ctx, cmd, pipeR, sandbox.Options{
 			SudoPassword: m.sudoPassword,
 		})
+		_ = pipeR.Close()
 		if err != nil {
 			return execResultMsg{err: err}
 		}
 		return execResultMsg{output: result.Combined()}
+
 	}
 }
 
@@ -2129,9 +2304,15 @@ func (m *Model) processNextToolCall() tea.Cmd {
 			callCopy := call
 			ctx, cancel := context.WithCancel(context.Background())
 			m.cancelExec = cancel
+			pipeR, pipeW := io.Pipe()
+			m.stdinPipe = pipeW
+			if m.sudoPassword != "" {
+				_, _ = fmt.Fprintln(pipeW, m.sudoPassword)
+			}
 			return tea.Batch(func() tea.Msg {
-				out, err := ExecuteRunCommand(ctx, callCopy, m.sudoPassword)
+				out, err := ExecuteRunCommand(ctx, callCopy, m.sudoPassword, pipeR)
 				cancel()
+				_ = pipeR.Close()
 				if err != nil {
 					return toolCallResultMsg{CallID: callCopy.ID, Name: callCopy.Name, Error: err}
 				}

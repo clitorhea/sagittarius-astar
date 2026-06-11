@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"io"
 	"os/exec"
 	"regexp"
 	"runtime"
@@ -65,6 +66,16 @@ type Options struct {
 // A hard timeout is applied automatically. If the parent context is already
 // shorter, that deadline wins.
 func Execute(ctx context.Context, command string, opts ...Options) (*Result, error) {
+	var stdinBuf bytes.Buffer
+	if len(opts) > 0 && opts[0].SudoPassword != "" {
+		stdinBuf.WriteString(opts[0].SudoPassword + "\n")
+	}
+	return ExecuteWithStdin(ctx, command, &stdinBuf, opts...)
+}
+
+// ExecuteWithStdin is like Execute but accepts a custom io.Reader for stdin.
+// Pass an io.Pipe reader to allow the TUI to inject lines while the process runs.
+func ExecuteWithStdin(ctx context.Context, command string, stdin io.Reader, opts ...Options) (*Result, error) {
 	var opt Options
 	if len(opts) > 0 {
 		opt = opts[0]
@@ -95,16 +106,14 @@ func Execute(ctx context.Context, command string, opts ...Options) (*Result, err
 	case "windows":
 		cmd = exec.CommandContext(timeoutCtx, "powershell.exe", "-NoProfile", "-NonInteractive", "-Command", command)
 	default: // linux, darwin, etc.
-		var stdin bytes.Buffer
 		if opt.SudoPassword != "" {
 			re := regexp.MustCompile(`\bsudo\b`)
 			command = re.ReplaceAllString(command, "sudo -S")
 			command = strings.ReplaceAll(command, "sudo -S -S", "sudo -S")
 			command = strings.ReplaceAll(command, "sudo -S -s", "sudo -S -s")
-			stdin.WriteString(opt.SudoPassword + "\n")
 		}
 		cmd = exec.CommandContext(timeoutCtx, "/bin/bash", "-c", command)
-		cmd.Stdin = &stdin
+		cmd.Stdin = stdin
 	}
 
 	if opt.WorkingDir != "" {
