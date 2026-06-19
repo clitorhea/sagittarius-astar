@@ -386,3 +386,21 @@ func getKeys(m map[string]string) []string {
 	}
 	return keys
 }
+
+// GetAPIKey resolves the API key dynamically from environment or file config.
+func GetAPIKey(provider ProviderName) string {
+	fc := LoadFileConfig()
+	switch provider {
+	case ProviderGemini:
+		if v := os.Getenv("GEMINI_API_KEY"); v != "" {
+			return v
+		}
+		return fc.GeminiAPIKey
+	case ProviderDeepSeek:
+		if v := os.Getenv("DEEPSEEK_API_KEY"); v != "" {
+			return v
+		}
+		return fc.DeepSeekAPIKey
+	}
+	return ""
+}

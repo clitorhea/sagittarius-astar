@@ -186,14 +186,7 @@ func runChat(_ *cobra.Command, _ []string) error {
 	logger.L.Debug("provider initialised", "provider", cfg.Provider, "model", cfg.Model)
 
 	// ── TUI ───────────────────────────────────────────────────────────────────
-	// Build per-provider API key map so the TUI can switch providers/models at runtime.
-	fc := config.LoadFileConfig()
-	apiKeys := map[string]string{
-		string(config.ProviderGemini):   coalesceEnv("GEMINI_API_KEY", fc.GeminiAPIKey),
-		string(config.ProviderDeepSeek): coalesceEnv("DEEPSEEK_API_KEY", fc.DeepSeekAPIKey),
-	}
-
-	model, err := tui.NewModel(provider, activeSession, cfg.SystemPrompt, version, string(cfg.Provider), cfg.Model, cfg.Persona, apiKeys)
+	model, err := tui.NewModel(provider, activeSession, cfg.SystemPrompt, version, string(cfg.Provider), cfg.Model, cfg.Persona)
 	if err != nil {
 		logger.L.Error("TUI init failed", "error", err)
 		return fmt.Errorf("failed to initialize TUI: %w", err)

@@ -87,8 +87,7 @@ type Model struct {
 	activeModel    string
 	activePersona  string
 
-	// Runtime switching — API keys per provider, personas from config
-	apiKeys    map[string]string  // provider name → API key
+	// Core dependencies
 	fileConfig *config.FileConfig // parsed config, for persona resolution
 
 	// autoApproveCommands skips the confirmation dialog for run_command tool calls.
@@ -157,7 +156,7 @@ type Model struct {
 }
 
 // NewModel constructs a new TUI model wired to the given LLM provider and session.
-func NewModel(provider llm.Provider, activeSession *session.Session, defaultSystemPrompt string, appVersion string, providerName string, modelName string, personaName string, apiKeys map[string]string) (*Model, error) {
+func NewModel(provider llm.Provider, activeSession *session.Session, defaultSystemPrompt string, appVersion string, providerName string, modelName string, personaName string) (*Model, error) {
 	// Text area
 	ta := textarea.New()
 	ta.Placeholder = "Ask anything… (Enter to send, Shift+Enter for newline, /help for commands)"
@@ -195,10 +194,6 @@ func NewModel(provider llm.Provider, activeSession *session.Session, defaultSyst
 		return nil, fmt.Errorf("tui: failed to create glamour renderer: %w", err)
 	}
 
-	if apiKeys == nil {
-		apiKeys = make(map[string]string)
-	}
-
 	ti := textinput.New()
 	ti.Placeholder = "Enter sudo password..."
 	ti.EchoMode = textinput.EchoPassword
@@ -227,7 +222,6 @@ func NewModel(provider llm.Provider, activeSession *session.Session, defaultSyst
 		activeProvider:      providerName,
 		activeModel:         modelName,
 		activePersona:       personaName,
-		apiKeys:             apiKeys,
 		fileConfig:          config.LoadFileConfig(),
 	}
 
@@ -238,6 +232,7 @@ func NewModel(provider llm.Provider, activeSession *session.Session, defaultSyst
 
 // Init satisfies tea.Model.
 func (m Model) Init() tea.Cmd {
+	enableWindowsQuickEdit()
 	return nil
 }
 
@@ -584,8 +579,8 @@ func (m Model) update(msg tea.Msg) (Model, tea.Cmd) {
 					}
 
 					// Switch to the named model (keep provider, keep history)
-					apiKey, hasKey := m.apiKeys[m.activeProvider]
-					if !hasKey || apiKey == "" {
+					apiKey := config.GetAPIKey(config.ProviderName(m.activeProvider))
+					if apiKey == "" {
 						m.appendOutput(errorStyle.Render(fmt.Sprintf("✗ No API key stored for provider %q", m.activeProvider)))
 						m.refreshViewport()
 						break
@@ -632,8 +627,8 @@ func (m Model) update(msg tea.Msg) (Model, tea.Cmd) {
 					}
 
 					arg = strings.ToLower(arg)
-					apiKey, hasKey := m.apiKeys[arg]
-					if !hasKey || apiKey == "" {
+					apiKey := config.GetAPIKey(config.ProviderName(arg))
+					if apiKey == "" {
 						m.appendOutput(errorStyle.Render(fmt.Sprintf(
 							"✗ No API key configured for %q. Set it in ~/.config/aig/config.json or via environment variable.", arg)))
 						m.refreshViewport()
@@ -1696,8 +1691,8 @@ func (m Model) handleSelection(id string) (Model, tea.Cmd) {
 			m.activeSession.Model = id
 			m.saveSession()
 		}
-		apiKey, hasKey := m.apiKeys[m.activeProvider]
-		if !hasKey || apiKey == "" {
+		apiKey := config.GetAPIKey(config.ProviderName(m.activeProvider))
+		if apiKey == "" {
 			m.appendOutput(errorStyle.Render(fmt.Sprintf("✗ No API key stored for provider %q", m.activeProvider)))
 			m.refreshViewport()
 			return m, nil
@@ -1727,8 +1722,8 @@ func (m Model) handleSelection(id string) (Model, tea.Cmd) {
 		if s.Model != "" {
 			m.activeModel = s.Model
 		}
-		apiKey, hasKey := m.apiKeys[m.activeProvider]
-		if hasKey && apiKey != "" {
+		apiKey := config.GetAPIKey(config.ProviderName(m.activeProvider))
+		if apiKey != "" {
 			newProvider, err := llm.NewProvider(m.activeProvider, apiKey, m.activeModel)
 			if err == nil {
 				m.provider = newProvider
@@ -1740,8 +1735,8 @@ func (m Model) handleSelection(id string) (Model, tea.Cmd) {
 		return m, nil
 
 	case "provider":
-		apiKey, hasKey := m.apiKeys[id]
-		if !hasKey || apiKey == "" {
+		apiKey := config.GetAPIKey(config.ProviderName(id))
+		if apiKey == "" {
 			m.appendOutput(errorStyle.Render(fmt.Sprintf(
 				"✗ No API key configured for %q. Set it in ~/.config/aig/config.json or via environment variable.", id)))
 			m.refreshViewport()
@@ -2169,6 +2164,14 @@ func (m *Model) startStreaming() []tea.Cmd {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	m.cancelStream = cancel
+
+	// Refresh the provider with the latest API key from config/env in case it was modified.
+	freshKey := config.GetAPIKey(config.ProviderName(m.activeProvider))
+	if freshKey != "" {
+		if newProvider, err := llm.NewProvider(m.activeProvider, freshKey, m.activeModel); err == nil {
+			m.provider = newProvider
+		}
+	}
 
 	// Background goroutine — calls the LLM provider.
 	streamCmd := func() tea.Msg {
