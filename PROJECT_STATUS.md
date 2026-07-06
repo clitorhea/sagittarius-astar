@@ -20,23 +20,32 @@ This file serves as a compressed "brain dump" for future AI agents working on th
 
 ## 🕒 Recent Implementations & Fixes
 
-1. **Abortable Executions & Interactive Stdin**
-   - **Abort (`Ctrl+C`)**: When a background command or AI tool is executing, pressing `Ctrl+C` triggers `killExec()`, which cancels the context, closes the stdin pipe, and safely returns an error to the LLM so it doesn't hang.
-   - **Stdin Injection (`Ctrl+I`)**: Added `stateRuntimeInput`. While a process is running, pressing `Ctrl+I` opens a text box at the bottom. Hitting Enter writes that line directly to the running process's stdin (via `m.stdinPipe`). Useful for SSH password prompts, script inputs, etc.
+1. **Model Context Protocol (MCP) Host Integration**
+   - **Subprocess Manager (`internal/mcp/manager.go`)**: Manages the lifecycle of MCP servers via standard I/O pipes. Supports SIGINT-to-SIGKILL graceful termination within 5 seconds on exit.
+   - **Multiplexed Client (`internal/mcp/client.go`)**: Multiplexes concurrent requests asynchronously. Features an enlarged 10 MiB scan buffer for massive directory/file returns.
+   - **Tool Registry (`internal/mcp/registry.go`)**: Performs dynamic initialization handshakes, runs `tools/list` on start, translates JSON schemas into LLM-compatible shapes, and routes tool calls to the correct client.
+   - **TUI Integration**: Added `mcpToolCallCmd` to run MCP calls in non-blocking Bubble Tea commands while maintaining TUI interactivity.
 
-2. **Dynamic API Key Reloading**
-   - **The Problem**: API keys used to be cached on startup. If a user edited `config.json`, the app ignored it.
-   - **The Fix**: Removed the `apiKeys` map from the `Model` struct. Now, `config.GetAPIKey()` dynamically resolves the key (checking ENV vars first, then `config.json`). `startStreaming()` recreates the LLM `Provider` right before generation to instantly pick up config edits without a restart.
+2. **Advanced Reasoning Streaming & Rendering**
+   - **Real-Time Thought Streaming**: Upgraded Gemini and DeepSeek providers to stream reasoning tokens immediately, prefixed with a null byte (`\x00`).
+   - **Visual Rendering**: Created a distinct styled display for reasoning (italicized, left-border indented Catppuccin palette).
+   - **StatusBar Toggle**: Toggles status text to `● deliberating` when the model is in its thinking cycle.
+   - **Plan-Action-Reflection (PAR) Loop**: Dynamically injects planning and reflection instructions into system prompts when tools are active.
 
-3. **Windows Native Text Selection (Mouse Copy/Paste)**
-   - **The Problem**: Bubble Tea naturally disables Windows' `ENABLE_QUICK_EDIT_MODE` on startup to prevent the terminal from freezing when clicked. However, this completely broke native text selection in Windows Terminal.
-   - **The Fix**: Added `internal/tui/console_windows.go` containing `enableWindowsQuickEdit()`. This hook fires during the Model's `Init()` phase, overriding Bubble Tea and forcing Quick Edit Mode back on. Text selection now works on Windows without holding Shift. `console_notwindows.go` acts as a no-op fallback.
+3. **Loop Breaker Circuit**
+   - **Consecutive Same-Call Breaker**: Intercepts tool execution if the exact same tool and argument hash are called 3 times consecutively. Halts the execution loop and injects a warning context to force model re-evaluation.
+   - **Consecutive Error Breaker**: Intercepts and aborts tool loops after 3 consecutive failures to prevent cascading resource waste.
+
+4. **Dynamic API Key Reloading & Windows Selection**
+   - **API Key Resolving**: Resolves keys dynamically on each generation run rather than caching on start.
+   - **Quick Edit Mode**: Restores Quick Edit Mode on Windows Terminal to enable native selection without breaking the TUI.
 
 ---
 
 ## ⚠️ Crucial Rules & Quirks for Future AIs
 
+- **Reasoning Prefix (`\x00`)**: Do not remove the null byte prefix from streamed reasoning tokens. The TUI relies on this prefix to route tokens to `reasoningBuffer` instead of `streamBuffer`.
+- **MCP Server Graces**: When adding or managing MCP servers, ensure `Registry.Shutdown()` is called *before* `Manager.Shutdown()` to drain pending requests safely before closing the pipes.
 - **Bubble Tea State Changes**: Whenever the `appState` changes to something that alters the UI height (like opening the Runtime Input box), you MUST ensure `m.recalculateDimensions()` is called so the viewport resizes correctly.
-- **Pipe Cleanups**: If you modify command execution, ensure `m.stdinPipe` is closed on BOTH ends when the command finishes or is killed to prevent resource leaks and hanging processes.
-- **API Keys & ENV Vars**: If a user complains that their config edits aren't working, remind them that `export DEEPSEEK_API_KEY=...` in their shell will *always* silently override the `config.json` file.
-- **Windows Quirks**: If modifying terminal input handling, remember we explicitly re-enable Quick Edit mode on Windows. Avoid anything that requires manual mouse event capturing (`WithMouseCellMotion`) unless absolutely necessary, as it will break native copy/paste again.
+- **Loop Breaker State Resets**: Ensure `consecutiveSameCalls` and `consecutiveErrors` are correctly reset upon tool execution successes or state changes to prevent false positives.
+- **Dynamic Context Injection**: Dynamic system instructions (like the PAR loop directive) should only be injected into the *outgoing* history array during streaming, keeping the session database/history clean.
