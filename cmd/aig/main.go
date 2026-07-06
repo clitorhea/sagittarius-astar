@@ -11,6 +11,7 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"log/slog"
 	"os"
@@ -22,6 +23,7 @@ import (
 	"github.com/clitorhea/sagittarius-astar.git/internal/config"
 	"github.com/clitorhea/sagittarius-astar.git/internal/llm"
 	"github.com/clitorhea/sagittarius-astar.git/internal/logger"
+	"github.com/clitorhea/sagittarius-astar.git/internal/mcp"
 	"github.com/clitorhea/sagittarius-astar.git/internal/session"
 	"github.com/clitorhea/sagittarius-astar.git/internal/tui"
 )
@@ -185,8 +187,61 @@ func runChat(_ *cobra.Command, _ []string) error {
 	}
 	logger.L.Debug("provider initialised", "provider", cfg.Provider, "model", cfg.Model)
 
-	// ── TUI ───────────────────────────────────────────────────────────────────
-	model, err := tui.NewModel(provider, activeSession, cfg.SystemPrompt, version, string(cfg.Provider), cfg.Model, cfg.Persona)
+	// ── MCP Server Bootstrap ─────────────────────────────────────────────────────────────────
+	// Spawn MCP servers declared in the config's mcp_servers map.
+	// Failures are non-fatal: aig degrades gracefully to native-tools-only mode.
+	var mcpRegistry *mcp.Registry
+	fc := config.LoadFileConfig()
+	if len(fc.MCPServers) > 0 {
+		mcpMgr := mcp.NewManager()
+
+		// Convert config.MCPServerConfig → mcp.ServerConfig (identical fields; kept
+		// separate to prevent a config → mcp import cycle in the config package).
+		serverConfigs := make(map[string]mcp.ServerConfig, len(fc.MCPServers))
+		for name, sc := range fc.MCPServers {
+			serverConfigs[name] = mcp.ServerConfig{
+				Command: sc.Command,
+				Args:    sc.Args,
+				Env:     sc.Env,
+			}
+		}
+
+		// Use context.Background() for subprocess lifetime — the processes must
+		// live for the entire session, not just the 15-second discovery window.
+		if err := mcpMgr.Start(context.Background(), serverConfigs); err != nil {
+			logger.L.Warn("MCP: failed to start servers, continuing without MCP tools", "error", err)
+		} else {
+			mcpRegistry = mcp.NewRegistry(mcpMgr)
+
+			// Short-lived context just for the RPC handshake + tools/list calls.
+			discoverCtx, discoverCancel := context.WithTimeout(context.Background(), 15*time.Second)
+			defer discoverCancel()
+
+			if err := mcpRegistry.Discover(discoverCtx); err != nil {
+				logger.L.Warn("MCP: tool discovery failed, continuing without MCP tools", "error", err)
+				mcpRegistry.Shutdown()
+				mcpMgr.Shutdown(context.Background())
+				mcpRegistry = nil
+			} else {
+				logger.L.Info("MCP: tools registered",
+					"servers", len(fc.MCPServers),
+					"tools", mcpRegistry.ToolCount(),
+				)
+				// Shut down registry clients before the manager closes the pipes.
+				defer func() {
+					mcpRegistry.Shutdown()
+					shutCtx, shutCancel := context.WithTimeout(context.Background(), 10*time.Second)
+					defer shutCancel()
+					mcpMgr.Shutdown(shutCtx)
+				}()
+			}
+		}
+	} else {
+		logger.L.Debug("MCP: no servers configured, skipping bootstrap")
+	}
+
+	// ── TUI ─────────────────────────────────────────────────────────────────────────────────
+	model, err := tui.NewModel(provider, activeSession, cfg.SystemPrompt, version, string(cfg.Provider), cfg.Model, cfg.Persona, mcpRegistry)
 	if err != nil {
 		logger.L.Error("TUI init failed", "error", err)
 		return fmt.Errorf("failed to initialize TUI: %w", err)
@@ -195,6 +250,7 @@ func runChat(_ *cobra.Command, _ []string) error {
 	p := tea.NewProgram(
 		model,
 		tea.WithAltScreen(),
+		tea.WithMouseCellMotion(),
 	)
 
 	logger.L.Debug("entering TUI event loop")

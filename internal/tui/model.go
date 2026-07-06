@@ -34,6 +34,7 @@ import (
 	"github.com/clitorhea/sagittarius-astar.git/internal/config"
 	"github.com/clitorhea/sagittarius-astar.git/internal/llm"
 	"github.com/clitorhea/sagittarius-astar.git/internal/logger"
+	"github.com/clitorhea/sagittarius-astar.git/internal/mcp"
 	"github.com/clitorhea/sagittarius-astar.git/internal/sandbox"
 	"github.com/clitorhea/sagittarius-astar.git/internal/session"
 	"github.com/clitorhea/sagittarius-astar.git/internal/workspace"
@@ -88,7 +89,10 @@ type Model struct {
 	activePersona  string
 
 	// Core dependencies
-	fileConfig *config.FileConfig // parsed config, for persona resolution
+	fileConfig    *config.FileConfig // parsed config, for persona resolution
+	// mcpRegistry holds the live MCP tool registry. Nil when no MCP servers are
+	// configured — all existing code paths remain unaffected in that case.
+	mcpRegistry   *mcp.Registry
 
 	// autoApproveCommands skips the confirmation dialog for run_command tool calls.
 	autoApproveCommands bool
@@ -156,7 +160,8 @@ type Model struct {
 }
 
 // NewModel constructs a new TUI model wired to the given LLM provider and session.
-func NewModel(provider llm.Provider, activeSession *session.Session, defaultSystemPrompt string, appVersion string, providerName string, modelName string, personaName string) (*Model, error) {
+// registry may be nil when no MCP servers are configured; all features work identically.
+func NewModel(provider llm.Provider, activeSession *session.Session, defaultSystemPrompt string, appVersion string, providerName string, modelName string, personaName string, registry *mcp.Registry) (*Model, error) {
 	// Text area
 	ta := textarea.New()
 	ta.Placeholder = "Ask anything… (Enter to send, Shift+Enter for newline, /help for commands)"
@@ -223,6 +228,7 @@ func NewModel(provider llm.Provider, activeSession *session.Session, defaultSyst
 		activeModel:         modelName,
 		activePersona:       personaName,
 		fileConfig:          config.LoadFileConfig(),
+		mcpRegistry:         registry,
 	}
 
 	return m, nil
@@ -1495,11 +1501,19 @@ func (m Model) update(msg tea.Msg) (Model, tea.Cmd) {
 		cmds = append(cmds, tiCmd)
 	}
 	// Only delegate to the viewport when the textarea is NOT focused.
-	// This prevents the viewport's built-in key bindings (arrows, pgup/pgdn)
-	// from stealing keystrokes meant for the text input, which causes
-	// scroll position jumps on Windows when the user types while scrolled up.
-	_, isKeyMsg := msg.(tea.KeyMsg)
-	if !isKeyMsg || (m.appState != stateInput && m.appState != stateInputSudoPassword) {
+	// This prevents the viewport's built-in key bindings (arrows)
+	// from stealing keystrokes meant for the text input.
+	keyMsg, isKeyMsg := msg.(tea.KeyMsg)
+	allowViewportUpdate := true
+	if isKeyMsg && (m.appState == stateInput || m.appState == stateInputSudoPassword) {
+		// In input states, block most keys from the viewport so arrow keys/typing don't scroll it.
+		// However, allow PgUp/PgDn so the user can still scroll the chat history.
+		if keyMsg.Type != tea.KeyPgUp && keyMsg.Type != tea.KeyPgDown {
+			allowViewportUpdate = false
+		}
+	}
+	
+	if allowViewportUpdate {
 		var vpCmd tea.Cmd
 		m.viewport, vpCmd = m.viewport.Update(msg)
 		cmds = append(cmds, vpCmd)
@@ -2177,7 +2191,13 @@ func (m *Model) startStreaming() []tea.Cmd {
 	streamCmd := func() tea.Msg {
 		// Prune to a default context limit (100k tokens approx ~400k chars)
 		prunedHistory := llm.PruneHistory(m.history, 100000)
-		toolCalls, reasoningContent, err := m.provider.StreamChat(ctx, prunedHistory, AgentTools(), ch)
+		// Build the combined tool list: native sandbox tools + any MCP-registered tools.
+		// If no MCP registry is wired (nil), this degrades cleanly to AgentTools() alone.
+		tools := AgentTools()
+		if m.mcpRegistry != nil {
+			tools = append(tools, m.mcpRegistry.LLMTools()...)
+		}
+		toolCalls, reasoningContent, err := m.provider.StreamChat(ctx, prunedHistory, tools, ch)
 		if err != nil {
 			return streamErrMsg{err: err}
 		}
@@ -2269,14 +2289,22 @@ func (m *Model) runSandboxCmd() tea.Cmd {
 }
 
 // processNextToolCall picks up the next call in pendingToolCalls and routes it:
-//   - run_command   → auto-approve (execute now) or stateConfirmingCmd
+//   - MCP tools        → dispatched via Registry.Call() in a tea.Cmd goroutine
+//   - run_command      → auto-approve (execute now) or stateConfirmingCmd
 //   - write_file / edit_file → stateConfirmingWrite with diff preview
-//   - everything else → execute immediately, return toolCallResultMsg
+//   - everything else  → execute immediately, return toolCallResultMsg
 func (m *Model) processNextToolCall() tea.Cmd {
 	if m.pendingToolIdx >= len(m.pendingToolCalls) {
 		return func() tea.Msg { return toolCallResultMsg{} }
 	}
 	call := m.pendingToolCalls[m.pendingToolIdx]
+
+	// ── MCP tool dispatch ──────────────────────────────────────────────────────────
+	// MCP tools are checked before the native switch so that registry-registered
+	// names always win, even if a name ever collides with a built-in tool.
+	if m.mcpRegistry != nil && m.mcpRegistry.IsMCPTool(call.Name) {
+		return m.mcpToolCallCmd(call)
+	}
 
 	switch call.Name {
 	case "run_command":
@@ -2397,6 +2425,47 @@ func (m *Model) processNextToolCall() tea.Cmd {
 			return toolCallResultMsg{CallID: callCopy.ID, Name: callCopy.Name, Result: resultStr}
 		}, m.spinner.Tick)
 	}
+}
+
+// mcpToolCallCmd dispatches a single MCP tool call as a non-blocking tea.Cmd.
+//
+// The RPC runs in a background goroutine; the UI transitions to stateExecutingTool
+// and shows a spinner while waiting. When the goroutine finishes (success, error,
+// or context cancellation via Ctrl+C), it delivers a toolCallResultMsg back to
+// the Update loop — the same message type used by all native tool paths — so
+// the existing pendingToolIdx advancement and re-streaming logic is reused exactly.
+//
+// Ctrl+C cancellation: the existing stateExecutingTool key handler calls
+// killExec(), which invokes m.cancelExec(). Since we store the context's cancel
+// func in m.cancelExec, this propagates context.Canceled into registry.Call(),
+// unblocking the goroutine within one RPC round-trip.
+func (m *Model) mcpToolCallCmd(call llm.ToolCall) tea.Cmd {
+	m.appState = stateExecutingTool
+	m.execStart = time.Now()
+	// MCP tools have no inherent execution timeout — the user's Ctrl+C is the
+	// escape valve. Set execTimeout generously so the elapsed timer stays sane.
+	m.execTimeout = 60 * time.Second
+
+	m.appendOutput(lipgloss.NewStyle().Foreground(colorYellow).Render(
+		fmt.Sprintf("🔌 MCP: %s", call.Name)))
+	m.refreshViewport()
+
+	// Wire cancellation into the existing killExec() infrastructure so that
+	// Ctrl+C aborts the in-flight RPC without any changes to the key handler.
+	ctx, cancel := context.WithCancel(context.Background())
+	m.cancelExec = cancel
+
+	// Capture pointers — do not close over the full Model value.
+	registry := m.mcpRegistry
+	callCopy := call
+	return tea.Batch(func() tea.Msg {
+		result, err := registry.Call(ctx, callCopy.Name, callCopy.Args)
+		cancel() // release cancel func even on the success path
+		if err != nil {
+			return toolCallResultMsg{CallID: callCopy.ID, Name: callCopy.Name, Error: err}
+		}
+		return toolCallResultMsg{CallID: callCopy.ID, Name: callCopy.Name, Result: result}
+	}, m.spinner.Tick)
 }
 
 

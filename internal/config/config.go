@@ -42,14 +42,36 @@ type Config struct {
 	SystemPrompt string
 }
 
+// MCPServerConfig describes a single Model Context Protocol server to spawn.
+// It matches the standard MCP config JSON structure used by Claude Desktop and
+// other MCP hosts, so existing server configs can be copy-pasted verbatim.
+//
+// Example entry in config.json:
+//
+//	"mcp_servers": {
+//	  "filesystem": {
+//	    "command": "npx",
+//	    "args": ["-y", "@modelcontextprotocol/server-filesystem", "/home/user/projects"],
+//	    "env": {}
+//	  }
+//	}
+type MCPServerConfig struct {
+	Command string            `json:"command"`        // executable to run, e.g. "npx" or "/usr/bin/python3"
+	Args    []string          `json:"args,omitempty"` // CLI arguments passed to the executable
+	Env     map[string]string `json:"env,omitempty"`  // extra environment variables (merged with os.Environ)
+}
+
 // FileConfig represents the JSON structure saved in ~/.config/aig/config.json.
 type FileConfig struct {
-	DefaultProvider string            `json:"default_provider"`
-	DefaultModel    string            `json:"default_model"`
-	DefaultPersona  string            `json:"default_persona,omitempty"`
-	GeminiAPIKey    string            `json:"gemini_api_key,omitempty"`
-	DeepSeekAPIKey  string            `json:"deepseek_api_key,omitempty"`
-	Personas        map[string]string `json:"personas,omitempty"`
+	DefaultProvider string                     `json:"default_provider"`
+	DefaultModel    string                     `json:"default_model"`
+	DefaultPersona  string                     `json:"default_persona,omitempty"`
+	GeminiAPIKey    string                     `json:"gemini_api_key,omitempty"`
+	DeepSeekAPIKey  string                     `json:"deepseek_api_key,omitempty"`
+	Personas        map[string]string          `json:"personas,omitempty"`
+	// MCPServers is an optional map of logical server names to their spawn configs.
+	// Leave empty (or omit) to run aig without any MCP servers.
+	MCPServers      map[string]MCPServerConfig `json:"mcp_servers,omitempty"`
 }
 
 var defaultPersonas = map[string]string{
@@ -250,6 +272,8 @@ func WriteDefaultConfig(path string) error {
 		GeminiAPIKey:    "",
 		DeepSeekAPIKey:  "",
 		Personas:        defaultPersonas,
+		// MCPServers is nil by default so the key is omitted from the written JSON.
+		// Users add entries manually to enable MCP tool servers; see MCPServerConfig GoDoc.
 	}
 
 	data, err := json.MarshalIndent(fc, "", "  ")
