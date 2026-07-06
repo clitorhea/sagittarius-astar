@@ -88,6 +88,14 @@ var (
 				Foreground(colorSubtext).
 				Italic(true)
 
+	// thinkingStyle renders model internal reasoning blocks.
+	thinkingStyle = lipgloss.NewStyle().
+			Border(lipgloss.NormalBorder(), false, false, false, true).
+			BorderForeground(colorOverlay).
+			Foreground(colorSubtext).
+			Italic(true).
+			PaddingLeft(2)
+
 	// inputStyle wraps the text-input area.
 	inputStyle = lipgloss.NewStyle().
 			Border(lipgloss.RoundedBorder()).

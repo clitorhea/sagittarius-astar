@@ -97,9 +97,10 @@ func (d *DeepSeekProvider) StreamChat(ctx context.Context, messages []Message, t
 	}
 
 	req := openai.ChatCompletionRequest{
-		Model:    d.model,
-		Messages: oaiMessages,
-		Stream:   true,
+		Model:      d.model,
+		Messages:   oaiMessages,
+		Stream:     true,
+		ToolChoice: "auto",
 	}
 
 	if len(tools) > 0 {
@@ -152,6 +153,12 @@ func (d *DeepSeekProvider) StreamChat(ctx context.Context, messages []Message, t
 		// Collect chain-of-thought tokens (thinking models only).
 		if rc := choice.Delta.ReasoningContent; rc != "" {
 			reasoningBuf.WriteString(rc)
+			select {
+			case <-ctx.Done():
+				logger.L.Warn("deepseek: stream cancelled by context", "tokens_received", tokenCount)
+				return nil, "", ctx.Err()
+			case tokenChan <- "\x00" + rc:
+			}
 		}
 
 		// Accumulate all tool call deltas by index.

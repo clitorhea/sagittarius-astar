@@ -25,6 +25,8 @@
 
 ### Core Capabilities
 - 🤖 **Multi-Provider & Model Integration** — Support for Google Gemini (official Go SDK, including `gemini-2.0-flash`, `gemini-2.5-pro`, etc.) and DeepSeek (OpenAI-compatible, including `deepseek-v4-flash`, `deepseek-v4-pro`, etc.). Switch providers and models on-the-fly inside the active session.
+- 🔌 **Model Context Protocol (MCP) Host** — Dynamic host architecture supporting any stdio transport MCP server. Discovers schemas via `tools/list` on startup, translates them dynamically into LLM function declarations, and runs RPC tool calls asynchronously.
+- 🧠 **Interleaved Reasoning & PAR Loops** — Renders model thinking phases in real-time under a separate, styled deliberating section (Catppuccin subtext, left border, status badge). Dynamically enforces a **Plan-Action-Reflection (PAR)** directive when tools are active to optimize tool-calling ergonomics.
 - ⚡ **Autonomous Tool-Calling Agent Loop** — Runs multi-turn tool loops sequentially to resolve complex tasks (e.g., read file, search, write/edit file, run test command, repeat).
 - 🌊 **Real-time Streaming TUI** — Built on Bubble Tea and Bubbles, featuring live token streaming, interactive spinners, and status bar updates.
 - 🎨 **Premium Aesthetics** — Custom Catppuccin Mocha themed UI, rounded borders, and dynamic status bars highlighting current state, active model, persona, and auto-approve mode status.
@@ -48,6 +50,7 @@ The agent can autonomously invoke these tools:
 ### Safety & Command Sandboxing
 - 🛡️ **Interactive Gating**: Full confirmation dialogs for file mutations (`write_file`, `edit_file`) showing unified diffs.
 - ⚡ **Auto-Approve Mode**: Enable auto-approve (`/approve-tools on` or CLI flag) to execute sandbox commands (`run_command`) autonomously without manual confirmation prompts.
+- 🔄 **Loop Breaker Circuit**: Automatically intercepts and blocks infinite loops or cascading errors. If the model invokes the exact same tool with identical arguments 3 times consecutively, or experiences 3 consecutive tool failures, execution is aborted, and a warning is injected to force re-evaluation.
 - 🛑 **Graceful Interrupts**: Cancel active streams or executing sandbox commands safely using `Ctrl+C` without crashing the application.
 
 ---
@@ -97,9 +100,26 @@ On first launch, `aig` generates a default `config.json` at:
     "default": "You are aig...",
     "sysadmin": "You are an expert Linux and Windows system administrator...",
     "coder": "You are an expert software engineer..."
+  },
+  "mcp_servers": {
+    "filesystem": {
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-filesystem", "/home/user/workspace"],
+      "env": {
+        "NODE_ENV": "production"
+      }
+    }
   }
 }
 ```
+
+### Model Context Protocol (MCP) Support
+`aig` acts as a dynamic MCP host. If the optional `mcp_servers` map is configured:
+1. **Subprocess Management**: Spawns configured servers as subprocesses using stdio pipes at startup.
+2. **Dynamic Discovery**: Automatically sends the `initialize` handshake and queries `tools/list` over the pipe.
+3. **LLM Translation**: Translates discovered schemas on-the-fly to function declarations for Gemini and OpenAI/DeepSeek models.
+4. **Asynchronous Execution**: Dispatches requested tools in non-blocking Bubble Tea commands with `Ctrl+C` interrupt support.
+
 
 ---
 
@@ -168,6 +188,10 @@ internal/
 │   ├── provider.go      Provider interface + Message type
 │   ├── gemini.go        google.golang.org/genai streaming
 │   └── deepseek.go      sashabaranov/go-openai + DeepSeek BaseURL
+├── mcp/
+│   ├── manager.go       Subprocess lifecycle manager
+│   ├── client.go        JSON-RPC 2.0 stdio client
+│   └── registry.go      Tool discovery & routing registry
 ├── tui/
 │   ├── model.go         Bubble Tea state machine (4 states)
 │   ├── messages.go      Custom tea.Msg types

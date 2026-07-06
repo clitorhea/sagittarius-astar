@@ -11,6 +11,7 @@ func EstimateHistoryTokens(messages []Message) int {
 	var total int
 	for _, msg := range messages {
 		total += EstimateTokens(msg.Content)
+		total += EstimateTokens(msg.ReasoningContent)
 	}
 	return total
 }

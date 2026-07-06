@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strings"
 
 	"google.golang.org/genai"
 
@@ -67,11 +68,32 @@ func (g *GeminiProvider) StreamChat(ctx context.Context, messages []Message, too
 		case RoleUser:
 			contents = append(contents, genai.NewContentFromText(msg.Content, genai.RoleUser))
 		case RoleAssistant:
+			var parts []*genai.Part
+			if msg.ReasoningContent != "" {
+				parts = append(parts, &genai.Part{
+					Thought: true,
+					Text:    msg.ReasoningContent,
+				})
+			}
 			if len(msg.ToolCalls) > 0 {
-				tc := msg.ToolCalls[0]
-				contents = append(contents, genai.NewContentFromFunctionCall(tc.Name, tc.Args, genai.RoleModel))
-			} else {
-				contents = append(contents, genai.NewContentFromText(msg.Content, genai.RoleModel))
+				for _, tc := range msg.ToolCalls {
+					parts = append(parts, &genai.Part{
+						FunctionCall: &genai.FunctionCall{
+							Name: tc.Name,
+							Args: tc.Args,
+						},
+					})
+				}
+			} else if msg.Content != "" {
+				parts = append(parts, &genai.Part{
+					Text: msg.Content,
+				})
+			}
+			if len(parts) > 0 {
+				contents = append(contents, &genai.Content{
+					Role:  genai.RoleModel,
+					Parts: parts,
+				})
 			}
 		case RoleTool:
 			var response map[string]any
@@ -96,10 +118,16 @@ func (g *GeminiProvider) StreamChat(ctx context.Context, messages []Message, too
 			})
 		}
 		cfg.Tools = []*genai.Tool{{FunctionDeclarations: decls}}
+		cfg.ToolConfig = &genai.ToolConfig{
+			FunctionCallingConfig: &genai.FunctionCallingConfig{
+				Mode: genai.FunctionCallingConfigModeAuto,
+			},
+		}
 	}
 
 	// Collect all function calls across the entire streamed response.
 	var collectedCalls []ToolCall
+	var reasoningBuf strings.Builder
 
 	for resp, err := range g.client.Models.GenerateContentStream(ctx, g.model, contents, cfg) {
 		if err != nil {
@@ -112,6 +140,18 @@ func (g *GeminiProvider) StreamChat(ctx context.Context, messages []Message, too
 				continue
 			}
 			for _, part := range cand.Content.Parts {
+				if part.Thought {
+					if part.Text != "" {
+						reasoningBuf.WriteString(part.Text)
+						select {
+						case <-ctx.Done():
+							logger.L.Warn("gemini: stream cancelled by context", "tokens_received", tokenCount)
+							return nil, "", ctx.Err()
+						case tokenChan <- "\x00" + part.Text:
+						}
+					}
+					continue
+				}
 				if part.FunctionCall != nil {
 					collectedCalls = append(collectedCalls, ToolCall{
 						ID:   part.FunctionCall.ID,
@@ -136,7 +176,7 @@ func (g *GeminiProvider) StreamChat(ctx context.Context, messages []Message, too
 
 	if len(collectedCalls) > 0 {
 		logger.L.Debug("gemini: tool calls received", "count", len(collectedCalls))
-		return collectedCalls, "", nil
+		return collectedCalls, reasoningBuf.String(), nil
 	}
-	return nil, "", nil
+	return nil, reasoningBuf.String(), nil
 }

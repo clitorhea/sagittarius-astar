@@ -15,6 +15,9 @@ package tui
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"io"
 	"os"
@@ -66,8 +69,27 @@ type selectionItem struct {
 
 type sessionTitleMsg string
 
+// ToolTelemetry tracks telemetry of an individual tool call execution.
+type ToolTelemetry struct {
+	Name     string        `json:"name"`
+	ArgsHash string        `json:"args_hash"`
+	Duration time.Duration `json:"duration"`
+	Success  bool          `json:"success"`
+}
+
 // Model is the Bubble Tea application model for aig.
 type Model struct {
+	// Telemetry and loop breaker governance
+	consecutiveSameCalls int
+	consecutiveErrors    int
+	lastToolName         string
+	lastArgsHash         string
+	loopErrorCount       int
+	toolTelemetry        []ToolTelemetry
+	// Real-time reasoning buffers
+	rawStreamBuffer      string
+	nativeReasoningBuf   string
+	isDeliberating       bool
 	// Core state
 	appState state
 	history  []llm.Message // full conversation history
@@ -1266,7 +1288,19 @@ func (m Model) update(msg tea.Msg) (Model, tea.Cmd) {
 
 	// ── Streaming token received ───────────────────────────────────────────
 	case tokenMsg:
-		m.streamBuffer += string(msg)
+		tokenStr := string(msg)
+		if strings.HasPrefix(tokenStr, "\x00") {
+			m.nativeReasoningBuf += tokenStr[1:]
+		} else {
+			m.rawStreamBuffer += tokenStr
+		}
+
+		// Perform Plan-Action-Reflection dynamic parsing of the raw stream buffer
+		content, reasoning, inThink := SplitReasoning(m.rawStreamBuffer)
+		m.streamBuffer = content
+		m.reasoningBuffer = m.nativeReasoningBuf + reasoning
+		m.isDeliberating = inThink || (len(m.nativeReasoningBuf) > 0 && len(content) == 0)
+
 		// Show live streaming text (unformatted, fast) in viewport.
 		m.refreshViewportStreaming()
 		return m, waitForToken(m.tokenChan)
@@ -1275,13 +1309,20 @@ func (m Model) update(msg tea.Msg) (Model, tea.Cmd) {
 	case streamDoneMsg:
 		raw := m.streamBuffer
 		m.streamBuffer = ""
+		m.rawStreamBuffer = ""
+		m.nativeReasoningBuf = ""
+		m.isDeliberating = false
 
 		// Add assistant turn to history. ReasoningContent comes from the
 		// streamDoneMsg for non-tool turns (DeepSeek thinking models).
+		reasoning := msg.ReasoningContent
+		if reasoning == "" {
+			reasoning = m.reasoningBuffer
+		}
 		m.history = append(m.history, llm.Message{
 			Role:             llm.RoleAssistant,
 			Content:          raw,
-			ReasoningContent: msg.ReasoningContent,
+			ReasoningContent: reasoning,
 		})
 		m.reasoningBuffer = ""
 		logger.L.Info("stream completed", "response_len", len(raw))
@@ -1299,6 +1340,9 @@ func (m Model) update(msg tea.Msg) (Model, tea.Cmd) {
 		}
 		label := assistantLabelStyle.Render("aig")
 		m.outputLines = append(m.outputLines, label)
+		if msg.ReasoningContent != "" {
+			m.outputLines = append(m.outputLines, thinkingStyle.Render(strings.TrimSpace(msg.ReasoningContent)))
+		}
 		m.outputLines = append(m.outputLines, strings.TrimRight(rendered, "\n"))
 		m.outputLines = append(m.outputLines, divider(m.width))
 
@@ -1404,6 +1448,14 @@ func (m Model) update(msg tea.Msg) (Model, tea.Cmd) {
 			m.outputLines = m.outputLines[:len(m.outputLines)-1]
 		}
 
+		if msg.ReasoningContent != "" {
+			label := assistantLabelStyle.Render("aig")
+			m.outputLines = append(m.outputLines, label)
+			m.outputLines = append(m.outputLines, thinkingStyle.Render(strings.TrimSpace(msg.ReasoningContent)))
+			m.outputLines = append(m.outputLines, divider(m.width))
+			m.refreshViewport()
+		}
+
 		calls := msg.Calls
 		if len(calls) == 0 {
 			m.resetToInput()
@@ -1420,10 +1472,14 @@ func (m Model) update(msg tea.Msg) (Model, tea.Cmd) {
 			ReasoningContent: msg.ReasoningContent,
 		})
 		m.reasoningBuffer = ""
+		m.rawStreamBuffer = ""
+		m.nativeReasoningBuf = ""
+		m.isDeliberating = false
 
 		// Store the batch and start processing from index 0.
 		m.pendingToolCalls = calls
 		m.pendingToolIdx = 0
+		m.loopErrorCount = 0
 		return m, m.processNextToolCall()
 
 	// ── Legacy single-tool path (kept for safety) ──────────────────────────
@@ -1434,6 +1490,39 @@ func (m Model) update(msg tea.Msg) (Model, tea.Cmd) {
 
 	case toolCallResultMsg:
 		resContent := msg.Result
+		success := msg.Error == nil
+
+		// Telemetry calculation
+		var args map[string]any
+		if m.pendingToolIdx < len(m.pendingToolCalls) {
+			args = m.pendingToolCalls[m.pendingToolIdx].Args
+		}
+		argsHash := hashArguments(args)
+		duration := time.Since(m.execStart)
+
+		if !success {
+			m.consecutiveErrors++
+			m.loopErrorCount++
+		} else {
+			m.consecutiveErrors = 0
+		}
+
+		telemetry := ToolTelemetry{
+			Name:     msg.Name,
+			ArgsHash: argsHash,
+			Duration: duration,
+			Success:  success,
+		}
+		m.toolTelemetry = append(m.toolTelemetry, telemetry)
+
+		logger.L.Info("tool execution telemetry",
+			"name", telemetry.Name,
+			"args_hash", telemetry.ArgsHash,
+			"duration_ms", telemetry.Duration.Milliseconds(),
+			"success", telemetry.Success,
+			"loop_error_count", m.loopErrorCount,
+		)
+
 		if msg.Error != nil {
 			resContent = fmt.Sprintf("Error: %s", msg.Error.Error())
 			m.appendOutput(errorStyle.Render(fmt.Sprintf("✗ Tool %s failed", msg.Name)))
@@ -1470,6 +1559,24 @@ func (m Model) update(msg tea.Msg) (Model, tea.Cmd) {
 			ToolName:   msg.Name,
 		})
 		m.saveSession()
+
+		// 3 consecutive errors breaker
+		if m.consecutiveErrors >= 3 {
+			m.appendOutput(errorStyle.Render("⚠️ Loop Breaker Circuit: Blocked execution due to 3 consecutive tool errors"))
+			m.appendOutput(errorStyle.Render("Injecting error warning context to model to break failure cascade..."))
+			m.refreshViewport()
+
+			m.pendingToolCalls = nil
+			m.pendingToolIdx = 0
+
+			m.history = append(m.history, llm.Message{
+				Role:    llm.RoleSystem,
+				Content: "⚠️ Loop Breaker Alert: The last 3 consecutive tool execution attempts resulted in errors. To prevent cascading failures and resource waste, execution has been intercepted and blocked. Please review the errors, fix your logic/syntax/arguments, and reflect on why the previous attempts failed before selecting a new path.",
+			})
+			m.saveSession()
+
+			return m, tea.Batch(m.startStreaming()...)
+		}
 
 		// Advance to the next tool in the batch, or re-stream if all done.
 		m.pendingToolIdx++
@@ -1879,17 +1986,22 @@ func (m *Model) loadHistory(history []llm.Message, keepScroll bool) {
 				divider(m.width),
 			)
 		} else if msg.Role == llm.RoleAssistant {
-			if msg.Content != "" {
-				rendered, err := m.renderer.Render(msg.Content)
-				if err != nil {
-					rendered = msg.Content
-				}
+			if msg.Content != "" || msg.ReasoningContent != "" {
 				label := assistantLabelStyle.Render("aig")
-				m.outputLines = append(m.outputLines,
-					label,
-					strings.TrimRight(rendered, "\n"),
-					divider(m.width),
-				)
+				m.outputLines = append(m.outputLines, label)
+
+				if msg.ReasoningContent != "" {
+					m.outputLines = append(m.outputLines, thinkingStyle.Render(strings.TrimSpace(msg.ReasoningContent)))
+				}
+
+				if msg.Content != "" {
+					rendered, err := m.renderer.Render(msg.Content)
+					if err != nil {
+						rendered = msg.Content
+					}
+					m.outputLines = append(m.outputLines, strings.TrimRight(rendered, "\n"))
+				}
+				m.outputLines = append(m.outputLines, divider(m.width))
 			}
 			// If there are tool calls in this assistant turn, render the completed ones.
 			for _, call := range msg.ToolCalls {
@@ -2175,6 +2287,9 @@ func (m *Model) startStreaming() []tea.Cmd {
 	m.tokenChan = ch
 	m.appState = stateStreaming
 	m.streamBuffer = ""
+	m.rawStreamBuffer = ""
+	m.nativeReasoningBuf = ""
+	m.isDeliberating = false
 
 	ctx, cancel := context.WithCancel(context.Background())
 	m.cancelStream = cancel
@@ -2197,7 +2312,38 @@ func (m *Model) startStreaming() []tea.Cmd {
 		if m.mcpRegistry != nil {
 			tools = append(tools, m.mcpRegistry.LLMTools()...)
 		}
-		toolCalls, reasoningContent, err := m.provider.StreamChat(ctx, prunedHistory, tools, ch)
+
+		// Dynamically append the Plan-Action-Reflection directive if tools are present
+		var outgoingHistory []llm.Message
+		if len(tools) > 0 {
+			outgoingHistory = make([]llm.Message, len(prunedHistory))
+			copy(outgoingHistory, prunedHistory)
+
+			parDirective := "\n\nPlan-Action-Reflection Loop Enforcements:\n" +
+				"When executing actions with access to tools, you must strictly follow this cycle:\n" +
+				"1. Plan: State your assumptions, sub-goals, and concrete action plan inside your internal reasoning block BEFORE emitting a tool call.\n" +
+				"2. Action: Call the appropriate tool with precise parameters.\n" +
+				"3. Reflection: After receiving the tool output, evaluate whether the observation satisfied the sub-goal, check for errors, and state your updated reasoning/next steps before either proceeding to the next tool or generating your final response."
+
+			found := false
+			for i, msg := range outgoingHistory {
+				if msg.Role == llm.RoleSystem {
+					outgoingHistory[i].Content = msg.Content + parDirective
+					found = true
+					break
+				}
+			}
+			if !found {
+				outgoingHistory = append([]llm.Message{{
+					Role:    llm.RoleSystem,
+					Content: parDirective,
+				}}, outgoingHistory...)
+			}
+		} else {
+			outgoingHistory = prunedHistory
+		}
+
+		toolCalls, reasoningContent, err := m.provider.StreamChat(ctx, outgoingHistory, tools, ch)
 		if err != nil {
 			return streamErrMsg{err: err}
 		}
@@ -2298,6 +2444,32 @@ func (m *Model) processNextToolCall() tea.Cmd {
 		return func() tea.Msg { return toolCallResultMsg{} }
 	}
 	call := m.pendingToolCalls[m.pendingToolIdx]
+	argsHash := hashArguments(call.Args)
+
+	if call.Name == m.lastToolName && argsHash == m.lastArgsHash {
+		m.consecutiveSameCalls++
+	} else {
+		m.consecutiveSameCalls = 1
+		m.lastToolName = call.Name
+		m.lastArgsHash = argsHash
+	}
+
+	if m.consecutiveSameCalls >= 3 {
+		m.appendOutput(errorStyle.Render(fmt.Sprintf("⚠️ Loop Breaker Circuit: Blocked 3 consecutive identical calls to %q", call.Name)))
+		m.appendOutput(errorStyle.Render("Injecting warning context to model to break repetition..."))
+		m.refreshViewport()
+
+		m.pendingToolCalls = nil
+		m.pendingToolIdx = 0
+
+		m.history = append(m.history, llm.Message{
+			Role:    llm.RoleSystem,
+			Content: fmt.Sprintf("⚠️ Loop Breaker Alert: You have attempted to call the tool %q with arguments %v 3 times consecutively. This action has been intercepted and blocked. Please stop executing this loop, re-evaluate your debugging strategy, verify all paths/files, and reflect on why the previous attempts failed before selecting a new path.", call.Name, call.Args),
+		})
+		m.saveSession()
+
+		return tea.Batch(m.startStreaming()...)
+	}
 
 	// ── MCP tool dispatch ──────────────────────────────────────────────────────────
 	// MCP tools are checked before the native switch so that registry-registered
@@ -2500,13 +2672,25 @@ func (m *Model) refreshViewportKeepPosition() {
 // refreshViewportStreaming appends the current streaming buffer as a preview.
 func (m *Model) refreshViewportStreaming() {
 	preview := strings.TrimRight(m.streamBuffer, "\n")
+	reasoning := strings.TrimRight(m.reasoningBuffer, "\n")
+
 	lines := m.outputLines
 	// Replace the last line (the "…" spinner placeholder) with live text.
 	if len(lines) > 0 && strings.Contains(lines[len(lines)-1], "…") {
 		lines = lines[:len(lines)-1]
 	}
+
 	label := assistantLabelStyle.Render("aig")
-	content := strings.Join(lines, "\n\n") + "\n\n" + label + "\n" + preview
+	content := strings.Join(lines, "\n\n") + "\n\n" + label
+
+	if reasoning != "" {
+		content += "\n" + thinkingStyle.Render(reasoning)
+	}
+
+	if preview != "" {
+		content += "\n\n" + preview
+	}
+
 	m.viewport.SetContent(content)
 	m.viewport.GotoBottom()
 }
@@ -2521,7 +2705,11 @@ func (m Model) statusBar() string {
 	var statusText string
 	switch m.appState {
 	case stateStreaming:
-		statusText = "● streaming"
+		if m.isDeliberating {
+			statusText = "● deliberating"
+		} else {
+			statusText = "● streaming"
+		}
 	case stateConfirmingCmd:
 		statusText = "⚠ awaiting confirmation"
 	case stateExecuting:
@@ -2636,4 +2824,55 @@ func helpOverlay() string {
 		"  /read(path)     Attach file content to next message",
 	}
 	return strings.Join(lines, "\n")
+}
+
+// hashArguments returns a SHA-256 hash string for the tool arguments, ensuring
+// deterministic output by letting encoding/json sort map keys automatically.
+func hashArguments(args map[string]any) string {
+	if len(args) == 0 {
+		return ""
+	}
+	b, err := json.Marshal(args)
+	if err != nil {
+		return ""
+	}
+	h := sha256.Sum256(b)
+	return hex.EncodeToString(h[:])
+}
+
+// SplitReasoning splits the accumulated raw text stream into standard content
+// and reasoning blocks by scanning for <think> and </think> tags. It returns the
+// cleaned final response text, the aggregated reasoning block, and a boolean
+// indicating if the stream is currently inside an open, unclosed thinking block.
+func SplitReasoning(input string) (string, string, bool) {
+	var sbContent, sbReasoning strings.Builder
+	pos := 0
+	n := len(input)
+	inThink := false
+	for pos < n {
+		thinkIdx := strings.Index(input[pos:], "<think>")
+		if thinkIdx == -1 {
+			if inThink {
+				sbReasoning.WriteString(input[pos:])
+			} else {
+				sbContent.WriteString(input[pos:])
+			}
+			break
+		}
+		// Write standard content up to <think> tag if we were not already in a think block.
+		// (though logically nesting think blocks shouldn't happen, we follow sequence).
+		sbContent.WriteString(input[pos : pos+thinkIdx])
+		pos += thinkIdx + 7
+		inThink = true
+
+		endIdx := strings.Index(input[pos:], "</think>")
+		if endIdx == -1 {
+			sbReasoning.WriteString(input[pos:])
+			break
+		}
+		sbReasoning.WriteString(input[pos : pos+endIdx])
+		pos += endIdx + 8
+		inThink = false
+	}
+	return sbContent.String(), sbReasoning.String(), inThink
 }
